@@ -1,25 +1,31 @@
 import numpy as np
 
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
-
 SAM2_CHECKPOINT = "sam2_hiera_large.pt"
 SAM2_CONFIG = "sam2_hiera_l.yaml"
 
-sam2_model = build_sam2(SAM2_CONFIG, SAM2_CHECKPOINT, device="cuda")
-sam2_predictor = SAM2ImagePredictor(sam2_model)
 
-def get_mask_from_click(frame, x, y):
-    sam2_predictor.set_image(frame)
+def build_sam2_predictor(
+    checkpoint: str = SAM2_CHECKPOINT,
+    config: str = SAM2_CONFIG,
+    device: str = "cuda",
+):
+    """Build and return a SAM2 image predictor."""
+    from sam2.build_sam import build_sam2
+    from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-    input_point = np.array([[x, y]])
-    input_label = np.array([1])
+    model = build_sam2(config, checkpoint, device=device)
+    predictor = SAM2ImagePredictor(model)
+    return predictor
 
-    masks, scores, _ = sam2_predictor.predict(
-        point_coords=input_point,
-        point_labels=input_label,
-        multimask_output=False
+
+def get_mask_from_click(predictor, frame, x: int, y: int) -> np.ndarray:
+    """Return a binary uint8 mask (0/255) for the object at (x, y)."""
+    predictor.set_image(frame)
+
+    masks, _, _ = predictor.predict(
+        point_coords=np.array([[x, y]]),
+        point_labels=np.array([1]),
+        multimask_output=False,
     )
 
-    mask = masks[0].astype(np.uint8) * 255
-    return mask
+    return masks[0].astype(np.uint8) * 255
