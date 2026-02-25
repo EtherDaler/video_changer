@@ -1,5 +1,56 @@
-ControlNet
-myvenv
-__pycache__
-RAFT
-sam2
+# Virtual environment
+myvenv/
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Model weights — скачиваются по инструкции из README
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.onnx
+*.ckpt
+*.pkl
+
+# HuggingFace cache (SDXL, ControlNet — скачиваются автоматически)
+~/.cache/huggingface/
+.cache/
+
+# SAM2 (editable install via pip)
+myvenv/src/sam-2/
+
+# GroundingDINO (если клонировали как репо)
+GroundingDINO/
+
+# RAFT (опциональный optical flow)
+RAFT/
+
+# Видео файлы
+videos/
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Логи и временные файлы
+*.log
+tmp/
+temp/

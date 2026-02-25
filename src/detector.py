@@ -8,7 +8,10 @@ Flow:
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
+import torch
 from PIL import Image
 
 
@@ -16,12 +19,27 @@ from PIL import Image
 # GROUNDING DINO
 # ──────────────────────────────────────────────
 
-GDINO_CONFIG = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 GDINO_CHECKPOINT = "groundingdino_swint_ogc.pth"
 
 
+def _gdino_config_path() -> str:
+    """Auto-detect the config bundled inside the installed groundingdino package."""
+    try:
+        import groundingdino
+        cfg = os.path.join(
+            os.path.dirname(groundingdino.__file__),
+            "config", "GroundingDINO_SwinT_OGC.py",
+        )
+        if os.path.exists(cfg):
+            return cfg
+    except ImportError:
+        pass
+    # Legacy fallback: cloned repo next to project root
+    return "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+
+
 def load_grounding_dino(
-    config_path: str = GDINO_CONFIG,
+    config_path: str | None = None,
     checkpoint_path: str = GDINO_CHECKPOINT,
     device: str = "cuda",
 ):
@@ -34,10 +52,12 @@ def load_grounding_dino(
             "  pip install groundingdino-py\n"
             "or from source: https://github.com/IDEA-Research/GroundingDINO"
         )
+    if config_path is None:
+        config_path = _gdino_config_path()
     return load_model(config_path, checkpoint_path, device=device)
 
 
-def _preprocess_for_gdino(image_np: np.ndarray):
+def _preprocess_for_gdino(image_np: np.ndarray) -> torch.Tensor:
     """Apply Grounding DINO's standard image transform."""
     import torchvision.transforms as T
 
@@ -46,7 +66,7 @@ def _preprocess_for_gdino(image_np: np.ndarray):
         T.ToTensor(),
         T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
-    return transform(Image.fromarray(image_np))
+    return transform(Image.fromarray(image_np))  # type: ignore[return-value]
 
 
 def detect_bbox(
@@ -55,6 +75,7 @@ def detect_bbox(
     text_prompt: str,
     box_threshold: float = 0.35,
     text_threshold: float = 0.25,
+    device: str = "cpu",
 ) -> tuple[tuple[int, int, int, int], str] | None:
     """
     Detect the best-matching bounding box for *text_prompt* in *image_np*.
@@ -73,6 +94,7 @@ def detect_bbox(
         caption=text_prompt,
         box_threshold=box_threshold,
         text_threshold=text_threshold,
+        device=device,
     )
 
     if len(boxes) == 0:
@@ -123,6 +145,7 @@ def text_to_mask(
     text_prompt: str,
     box_threshold: float = 0.35,
     text_threshold: float = 0.25,
+    device: str = "cpu",
 ) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None, str | None]:
     """
     End-to-end: text prompt → segmentation mask.
@@ -132,7 +155,7 @@ def text_to_mask(
     """
     result = detect_bbox(
         grounding_model, image_np, text_prompt,
-        box_threshold, text_threshold,
+        box_threshold, text_threshold, device=device,
     )
     if result is None:
         return None, None, None

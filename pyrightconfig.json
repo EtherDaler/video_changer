@@ -1,0 +1,11 @@
+{
+  "venvPath": ".",
+  "venv": "myvenv",
+  "extraPaths": [
+    "src",
+    "myvenv/src/sam-2"
+  ],
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none",
+  "typeCheckingMode": "basic"
+}

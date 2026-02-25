@@ -1,13 +1,19 @@
 import argparse
+from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    # RAFT is not a pip package — imported at runtime via PYTHONPATH.
+    # These stubs silence IDE "unresolved import" warnings.
+    from raft import RAFT  # type: ignore[import]
+    from utils.utils import InputPadder  # type: ignore[import]
 
 
 def load_raft(model_path: str, device: str = "cuda") -> torch.nn.Module:
     """Load RAFT optical flow model from checkpoint."""
     try:
-        from raft import RAFT
+        from raft import RAFT  # type: ignore[import]
     except ImportError:
         raise ImportError(
             "RAFT not found. Clone https://github.com/princeton-vl/RAFT "
@@ -35,7 +41,7 @@ def compute_flow_raft(
 ):
     """Compute dense optical flow between two RGB numpy frames using RAFT."""
     try:
-        from utils.utils import InputPadder
+        from utils.utils import InputPadder  # type: ignore[import]
     except ImportError:
         raise ImportError(
             "RAFT utils not found. Make sure RAFT repo root is in PYTHONPATH."

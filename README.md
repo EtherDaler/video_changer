@@ -5,15 +5,21 @@ AI-инструмент для замены объектов на видео: н
 ## Как это работает
 
 ```
-Видео → Извлечение кадров → Сегментация (SAM2)
-      → Трекинг маски (Optical Flow)
-      → ControlNet (Canny + Depth)
+Видео
+  → Извлечение кадров
+  → Детекция объекта (Grounding DINO или клик)
+  → Начальная маска (SAM2 Image Predictor)
+  → Трекинг маски по всему видео (SAM2 Video Predictor)
+  → Для кадров с объектом:
+      → ControlNet (Canny [+ Depth])
       → Inpainting SDXL
-      → Temporal consistency
+      → Temporal consistency (optical flow)
       → Цветовая гармонизация
       → Совпадение зернистости и motion blur
-      → Сборка видео
+  → Сборка видео
 ```
+
+> Кадры без объекта (объект вышел за край кадра, перекрыт и т.д.) копируются без обработки — диффузионная модель на них не запускается.
 
 ### Три режима выбора объекта
 
@@ -33,7 +39,7 @@ AI-инструмент для замены объектов на видео: н
 | MPS (macOS Apple Silicon) | 16 GB RAM | 32 GB unified memory |
 | CPU | 32 GB RAM | — (очень медленно) |
 
-> SDXL-inpainting требует значительных ресурсов. На CPU обработка одного кадра может занимать несколько минут.
+> На macOS MPS SDXL обрабатывает ~3 мин/кадр. Для быстрой проверки используй `--steps 10`.
 
 ---
 
@@ -119,7 +125,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
 ```
 
-#### macOS (Apple Silicon M1/M2/M3 — MPS) и macOS Intel
+#### macOS (Apple Silicon M1/M2/M3/M4 — MPS) и macOS Intel
 
 ```bash
 pip install torch torchvision torchaudio
@@ -159,17 +165,20 @@ pip install -r requirements.txt
 
 ### 5. Скачать модели
 
-#### SAM2 (Segment Anything Model 2)
+Все модели кладутся в **корень проекта** (рядом с `src/`).
+
+#### SAM2.1 (Segment Anything Model 2)
 
 ```bash
 # Linux / macOS
 wget https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt -O sam2_hiera_large.pt
-wget https://raw.githubusercontent.com/facebookresearch/sam2/main/sam2/configs/sam2.1/sam2.1_hiera_l.yaml -O sam2_hiera_l.yaml
 
 # Windows (PowerShell)
 Invoke-WebRequest -Uri "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt" -OutFile "sam2_hiera_large.pt"
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/facebookresearch/sam2/main/sam2/configs/sam2.1/sam2.1_hiera_l.yaml" -OutFile "sam2_hiera_l.yaml"
 ```
+
+Конфиг SAM2 идёт внутри пакета (устанавливается автоматически через `requirements.txt`).
+По умолчанию используется путь `configs/sam2.1/sam2.1_hiera_l.yaml` — менять не нужно.
 
 #### Grounding DINO (нужен для режимов `text` и `auto`)
 
@@ -181,17 +190,7 @@ wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alp
 Invoke-WebRequest -Uri "https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth" -OutFile "groundingdino_swint_ogc.pth"
 ```
 
-Конфиг Grounding DINO идёт внутри пакета `groundingdino-py`. Нужно узнать путь:
-
-```bash
-python -c "import groundingdino; import os; print(os.path.dirname(groundingdino.__file__))"
-```
-
-Затем передать путь в `--gdino-config`:
-
-```
-<путь_из_команды_выше>/config/GroundingDINO_SwinT_OGC.py
-```
+Конфиг Grounding DINO определяется автоматически из установленного пакета. Ничего дополнительно скачивать не нужно.
 
 #### SDXL + ControlNet (скачиваются автоматически с HuggingFace)
 
@@ -202,19 +201,18 @@ pip install huggingface_hub
 huggingface-cli login   # опционально, для приватных моделей
 ```
 
-#### RAFT (опционально, для более точного optical flow)
+#### RAFT (опционально, для более точного temporal blending)
 
 ```bash
 git clone https://github.com/princeton-vl/RAFT.git
 cd RAFT
-# Скачать веса:
 # Linux / macOS
 ./download_models.sh
 # Windows: открыть download_models.sh и вручную скачать raft-things.pth
 cd ..
 ```
 
-При использовании добавлять в PYTHONPATH:
+При использовании добавить в PYTHONPATH:
 
 ```bash
 # Linux / macOS
@@ -244,16 +242,17 @@ pip install xformers
 ```
 video_changer/
 ├── src/
-│   ├── main.py
-│   ├── detector.py
-│   ├── ui.py
-│   ├── sam_load.py
-│   ├── raft_load.py
-│   └── multy_control_net.py
-├── sam2_hiera_large.pt          ← скачать вручную
-├── sam2_hiera_l.yaml            ← скачать вручную
-├── groundingdino_swint_ogc.pth  ← скачать вручную
-├── RAFT/                        ← опционально
+│   ├── main.py             — основной скрипт
+│   ├── detector.py         — Grounding DINO + SAM2 (text→mask)
+│   ├── sam_load.py         — SAM2 Image Predictor
+│   ├── sam_video.py        — SAM2 Video Predictor (трекинг по всему видео)
+│   ├── ui.py               — интерактивный OpenCV UI
+│   ├── raft_load.py        — RAFT optical flow (опционально)
+│   └── multy_control_net.py — Multi-ControlNet (Canny + Depth)
+├── sam2_hiera_large.pt          ← скачать (шаг 5)
+├── groundingdino_swint_ogc.pth  ← скачать (шаг 5)
+├── RAFT/                        ← опционально (шаг 5)
+├── videos/                      ← папка для входных/выходных видео
 ├── myvenv/
 ├── requirements.txt
 └── README.md
@@ -265,25 +264,37 @@ video_changer/
 
 Все команды выполняются из корня проекта при активированном виртуальном окружении.
 
+### Быстрая проверка (мало шагов — для теста)
+
+```bash
+python src/main.py \
+  --input  videos/input.mp4 \
+  --output videos/output.mp4 \
+  --mode   text \
+  --detect-prompt "mug" \
+  --prompt "ceramic mug with space galaxy design, photorealistic" \
+  --steps  10
+```
+
 ### Режим auto (рекомендуется)
 
 ```bash
 python src/main.py \
-  --input  input.mp4 \
-  --output output.mp4 \
+  --input  videos/input.mp4 \
+  --output videos/output.mp4 \
   --mode   auto \
   --detect-prompt "ceramic mug" \
   --prompt "ceramic mug with space galaxy design, photorealistic, studio lighting"
 ```
 
-Программа откроет первый кадр видео, покажет что нашла, и предложит подтвердить или уточнить выделение.
+Программа покажет найденный объект в окне и предложит подтвердить или уточнить.
 
 ### Режим click (ручной выбор объекта)
 
 ```bash
 python src/main.py \
-  --input  input.mp4 \
-  --output output.mp4 \
+  --input  videos/input.mp4 \
+  --output videos/output.mp4 \
   --mode   click \
   --prompt "mug with dragon print, hyperrealistic"
 ```
@@ -294,8 +305,8 @@ python src/main.py \
 
 ```bash
 python src/main.py \
-  --input         input.mp4 \
-  --output        output.mp4 \
+  --input         videos/input.mp4 \
+  --output        videos/output.mp4 \
   --mode          text \
   --detect-prompt "mug" \
   --prompt        "red mug with golden logo"
@@ -305,8 +316,9 @@ python src/main.py \
 
 ```bash
 python src/main.py \
-  --input          input.mp4 \
-  --output         output.mp4 \
+  --input          videos/input.mp4 \
+  --output         videos/output.mp4 \
+  --mode           auto \
   --detect-prompt  "ceramic mug" \
   --prompt         "ceramic mug with dragon, hyperrealistic, 8k, studio lighting" \
   --multi-controlnet \
@@ -340,19 +352,22 @@ python src/main.py --device cpu ...
 | `--output` | `output.mp4` | Выходное видео |
 | `--mode` | `auto` | Режим выбора: `click`, `text`, `auto` |
 | `--detect-prompt` | *(первые 3 слова --prompt)* | Что найти на видео (для Grounding DINO) |
-| `--prompt` | *(встроенный)* | Что сгенерировать вместо (для SDXL) |
+| `--box-threshold` | `0.35` | Порог уверенности bbox (ниже → больше детекций) |
+| `--text-threshold` | `0.25` | Порог совпадения текста (ниже → мягче поиск) |
+| `--scan-frames` | `10` | Сколько кадров сканировать если объект не на кадре 0 |
+| `--prompt` | *(встроенный)* | Что сгенерировать вместо объекта (для SDXL) |
 | `--negative-prompt` | *(встроенный)* | Что исключить из генерации |
 | `--device` | *(авто)* | `cuda` / `mps` / `cpu` |
 | `--seed` | `42` | Фиксированный seed для воспроизводимости |
 | `--steps` | `30` | Шаги диффузии на кадр (больше = лучше, медленнее) |
 | `--guidance-scale` | `7.5` | CFG scale (выше = строже следует промпту) |
 | `--blend-alpha` | `0.85` | Темпоральный блендинг (1.0 = без сглаживания) |
-| `--multi-controlnet` | выкл | Canny + Depth ControlNet (выше качество) |
+| `--multi-controlnet` | выкл | Canny + Depth ControlNet (выше качество, медленнее) |
 | `--use-raft` | выкл | RAFT вместо Farneback (точнее, нужен RAFT repo) |
 | `--raft-model` | `RAFT/models/raft-things.pth` | Путь к весам RAFT |
 | `--sam2-checkpoint` | `sam2_hiera_large.pt` | Путь к весам SAM2 |
-| `--sam2-config` | `sam2_hiera_l.yaml` | Путь к конфигу SAM2 |
-| `--gdino-config` | *(внутри пакета)* | Путь к конфигу Grounding DINO |
+| `--sam2-config` | `configs/sam2.1/sam2.1_hiera_l.yaml` | Путь к конфигу SAM2 |
+| `--gdino-config` | *(внутри пакета)* | Путь к конфигу Grounding DINO (авто) |
 | `--gdino-checkpoint` | `groundingdino_swint_ogc.pth` | Путь к весам Grounding DINO |
 
 ---
@@ -373,18 +388,39 @@ python src/main.py --device cpu ...
 
 ### `CUDA out of memory`
 
-Уменьши количество шагов и/или отключи multi-controlnet:
-
 ```bash
-python src/main.py --steps 20 ...
-# Или освободить VRAM перед запуском, закрыв другие программы
+# Уменьши шаги и/или отключи multi-controlnet
+python src/main.py --steps 15 ...
 ```
 
 ### Grounding DINO не находит объект
 
-- Попробуй более простой текст: вместо `"white ceramic coffee mug"` → `"mug"` или `"cup"`
-- Уменьши пороги через `--mode auto` и переопредели в коде: в `detector.py` параметры `box_threshold=0.35` (уменьши до `0.25`)
-- Переключись на `--mode click`
+- Попробуй более простое слово: `"mug"`, `"cup"`, `"watch"`, `"bottle"` вместо длинных фраз
+- Снизь пороги:
+  ```bash
+  --box-threshold 0.20 --text-threshold 0.15
+  ```
+- Увеличь диапазон сканирования кадров:
+  ```bash
+  --scan-frames 30
+  ```
+- Переключись на ручной режим: `--mode click`
+
+### На macOS MPS всё очень медленно
+
+Это нормально — Apple Silicon не имеет полноценной поддержки SDXL.
+Для быстрой проверки результата:
+
+```bash
+python src/main.py --steps 10 ...
+```
+
+Также можно ограничить использование памяти:
+
+```bash
+export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
+python src/main.py --device mps ...
+```
 
 ### `ModuleNotFoundError: No module named 'groundingdino'`
 
@@ -401,21 +437,17 @@ cd GroundingDINO && pip install -e . && cd ..
 pip install -e git+https://github.com/facebookresearch/sam2.git#egg=SAM_2
 ```
 
-### На macOS: `MPS backend out of memory`
+### `AttributeError: 'BertModel' object has no attribute 'get_head_mask'`
+
+Несовместимость `groundingdino-py` с `transformers >= 4.48`. Исправить:
 
 ```bash
-# Ограничить использование памяти MPS
-export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
-python src/main.py --device mps ...
+pip install "transformers>=4.40.0,<4.48.0"
 ```
 
-### На Windows: ошибка при сборке видео через imageio
+### `RuntimeError: Error(s) in loading state_dict for SAM2Base`
 
-```bash
-pip install imageio-ffmpeg
-# Убедиться что ffmpeg установлен и доступен в PATH:
-ffmpeg -version
-```
+Несоответствие чекпоинта и конфига SAM2. Убедись, что скачал именно `sam2.1_hiera_large.pt` (не старый `sam2_hiera_large.pt`), и используй конфиг по умолчанию `configs/sam2.1/sam2.1_hiera_l.yaml`.
 
 ### `RuntimeError: SAM2 checkpoint not found`
 
@@ -426,6 +458,14 @@ cd /path/to/video_changer
 python src/main.py ...
 ```
 
+### На Windows: ошибка при сборке видео через imageio
+
+```bash
+pip install imageio-ffmpeg
+# Убедиться что ffmpeg установлен и доступен в PATH:
+ffmpeg -version
+```
+
 ---
 
 ## Зависимости (ключевые)
@@ -433,10 +473,11 @@ python src/main.py ...
 | Библиотека | Версия | Назначение |
 |-----------|--------|-----------|
 | PyTorch | 2.x | Основной DL фреймворк |
-| diffusers | 0.36+ | SDXL Inpainting pipeline |
-| SAM2 | latest | Сегментация объектов |
-| Grounding DINO | 0.4+ | Детекция по тексту |
+| diffusers | 0.30+ | SDXL Inpainting pipeline |
+| SAM2 | latest (git) | Сегментация и трекинг объектов |
+| Grounding DINO | 0.4+ | Детекция по текстовому промпту |
+| transformers | 4.40–4.47 | Текстовые энкодеры (BERT для DINO, CLIP для SDXL) |
 | controlnet_aux | 0.0.10 | Depth/Canny карты для ControlNet |
-| opencv-python | 4.x | Обработка видео и UI |
+| opencv-python | 4.x | Обработка видео и интерактивный UI |
 | imageio + imageio-ffmpeg | 2.x | Сборка видео |
 | RAFT | — | Точный optical flow (опционально) |

@@ -8,11 +8,14 @@ Video object replacement pipeline:
 import argparse
 
 import cv2
-import imageio
+import imageio.v2 as imageio
 import numpy as np
 import torch
 from PIL import Image
-from diffusers import ControlNetModel, StableDiffusionXLControlNetInpaintPipeline
+from diffusers.models.controlnets.controlnet import ControlNetModel
+from diffusers.pipelines.controlnet.pipeline_controlnet_inpaint_sd_xl import (
+    StableDiffusionXLControlNetInpaintPipeline,
+)
 
 
 # ──────────────────────────────────────────────
@@ -54,10 +57,11 @@ def load_pipeline(
         from multy_control_net import build_multi_controlnet_pipe
         return build_multi_controlnet_pipe(dtype, device)
 
-    controlnet = ControlNetModel.from_pretrained(
+    controlnet: ControlNetModel = ControlNetModel.from_pretrained(  # type: ignore[assignment]
         "diffusers/controlnet-canny-sdxl-1.0",
         torch_dtype=dtype,
-    ).to(device)
+    )
+    controlnet = controlnet.to(device)  # type: ignore[assignment]
 
     pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
         "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
@@ -117,7 +121,12 @@ def make_depth(image_np: np.ndarray, depth_detector) -> Image.Image:
 def compute_flow_farneback(frame1: np.ndarray, frame2: np.ndarray) -> np.ndarray:
     g1 = cv2.cvtColor(frame1, cv2.COLOR_RGB2GRAY)
     g2 = cv2.cvtColor(frame2, cv2.COLOR_RGB2GRAY)
-    return cv2.calcOpticalFlowFarneback(g1, g2, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    # OpenCV stubs incorrectly mark `flow` as non-optional; None is valid at runtime.
+    no_initial_flow: np.ndarray = np.zeros((*g1.shape, 2), dtype=np.float32)
+    flow: np.ndarray = cv2.calcOpticalFlowFarneback(
+        g1, g2, no_initial_flow, 0.5, 3, 15, 3, 5, 1.2, 0
+    )
+    return flow
 
 
 def _remap(src: np.ndarray, flow: np.ndarray, interp: int) -> np.ndarray:
@@ -301,7 +310,7 @@ def match_motion_blur(
 # ──────────────────────────────────────────────
 
 def assemble_video(frames: list[np.ndarray], output_path: str, fps: float) -> None:
-    imageio.mimsave(output_path, frames, fps=fps)
+    imageio.mimsave(output_path, frames, fps=fps)  # type: ignore[call-overload]
 
 
 # ──────────────────────────────────────────────
@@ -310,20 +319,25 @@ def assemble_video(frames: list[np.ndarray], output_path: str, fps: float) -> No
 
 def _build_sam(args) -> object:
     from sam_load import build_sam2_predictor
-    return build_sam2_predictor(args.sam2_checkpoint, args.sam2_config)
+    return build_sam2_predictor(args.sam2_checkpoint, args.sam2_config, device=DEVICE)
 
 
-def _select_mask(args: argparse.Namespace, first_frame: np.ndarray) -> np.ndarray:
+def _select_mask(
+    args: argparse.Namespace,
+    frames: list[np.ndarray],
+) -> tuple[np.ndarray, int]:
     """
-    Return the initial mask for the object the user wants to replace.
+    Return (initial_mask, seed_frame_idx) for the object the user wants to replace.
 
-    mode=click  → interactive click → SAM2
-    mode=text   → Grounding DINO → SAM2 (fully automatic)
-    mode=auto   → Grounding DINO → preview → [accept | refine by click | redo text]
+    mode=click  → interactive click on frame 0 → SAM2
+    mode=text   → Grounding DINO scans first --scan-frames frames → SAM2
+    mode=auto   → Grounding DINO → preview → [accept | refine by click | redo]
     """
     from ui import select_click_point, confirm_mask, show_bbox_preview
     from sam_load import get_mask_from_click
     from detector import load_grounding_dino, detect_bbox, get_mask_from_bbox, text_to_mask
+
+    first_frame = frames[0]
 
     # Derive detect_prompt from the generation prompt if not given
     detect_prompt = args.detect_prompt or " ".join(args.prompt.split()[:3])
@@ -342,39 +356,78 @@ def _select_mask(args: argparse.Namespace, first_frame: np.ndarray) -> np.ndarra
                 break
             elif decision == "cancel":
                 raise SystemExit("Selection cancelled.")
-            # "redo" or "refine" → loop again
         del sam
         torch.cuda.empty_cache()
-        return mask
+        return mask, 0
 
     # ── text ───────────────────────────────────────────────────────────────
     if args.mode == "text":
-        print(f"Text mode: detecting \"{detect_prompt}\"…")
-        gdino = load_grounding_dino(args.gdino_config, args.gdino_checkpoint)
+        print(f"Text mode: detecting \"{detect_prompt}\" (scanning up to {args.scan_frames} frames)…")
+        gdino = load_grounding_dino(args.gdino_config, args.gdino_checkpoint, device=DEVICE)
         sam = _build_sam(args)
-        mask, bbox, phrase = text_to_mask(gdino, sam, first_frame, detect_prompt)
+
+        mask, bbox, phrase, seed_idx = None, None, None, 0
+        scan_limit = min(args.scan_frames, len(frames))
+        for fi in range(scan_limit):
+            mask, bbox, phrase = text_to_mask(
+                gdino, sam, frames[fi], detect_prompt,
+                box_threshold=args.box_threshold,
+                text_threshold=args.text_threshold,
+                device=DEVICE,
+            )
+            if mask is not None:
+                seed_idx = fi
+                break
+
         del gdino, sam
         torch.cuda.empty_cache()
+
         if mask is None:
             raise RuntimeError(
-                f"Grounding DINO could not find \"{detect_prompt}\" in the first frame.\n"
-                "Try --mode auto or --mode click, or adjust --detect-prompt."
+                f"Grounding DINO could not find \"{detect_prompt}\" "
+                f"in the first {scan_limit} frames.\n"
+                f"Tips:\n"
+                f"  • Try a simpler word: \"mug\", \"cup\", \"watch\", \"bottle\"\n"
+                f"  • Lower thresholds: --box-threshold 0.2 --text-threshold 0.15\n"
+                f"  • Scan more frames: --scan-frames 30\n"
+                f"  • Switch mode: --mode click"
             )
-        print(f"  Detected: \"{phrase}\" at {bbox}")
-        return mask
+        print(f"  Detected: \"{phrase}\" on frame {seed_idx} at {bbox}")
+        return mask, seed_idx
 
     # ── auto ───────────────────────────────────────────────────────────────
-    # auto = text detection first, then let the user confirm / refine
-    print(f"Auto mode: detecting \"{detect_prompt}\"…")
-    gdino = load_grounding_dino(args.gdino_config, args.gdino_checkpoint)
+    # auto = text detection first (scans first N frames), then user confirms / refines
+    print(f"Auto mode: detecting \"{detect_prompt}\" (scanning up to {args.scan_frames} frames)…")
+    gdino = load_grounding_dino(args.gdino_config, args.gdino_checkpoint, device=DEVICE)
     sam = _build_sam(args)
+
+    # Find first frame where the object is detected
+    scan_limit = min(args.scan_frames, len(frames))
+    seed_idx = 0
+    seed_frame = first_frame
+    for fi in range(scan_limit):
+        probe = detect_bbox(
+            gdino, frames[fi], detect_prompt,
+            box_threshold=args.box_threshold,
+            text_threshold=args.text_threshold,
+            device=DEVICE,
+        )
+        if probe is not None:
+            seed_idx = fi
+            seed_frame = frames[fi]
+            break
 
     mask = None
     while mask is None:
-        result = detect_bbox(gdino, first_frame, detect_prompt)
+        result = detect_bbox(
+            gdino, seed_frame, detect_prompt,
+            box_threshold=args.box_threshold,
+            text_threshold=args.text_threshold,
+            device=DEVICE,
+        )
 
         if result is None:
-            print(f"  Not found. Enter a new description (or leave empty to switch to click):")
+            print(f"  Not found on frame {seed_idx}. Enter a new description (or leave empty to switch to click):")
             new_prompt = input("  detect-prompt> ").strip()
             if not new_prompt:
                 break  # fall through to click fallback
@@ -384,7 +437,7 @@ def _select_mask(args: argparse.Namespace, first_frame: np.ndarray) -> np.ndarra
         bbox, phrase = result
 
         # Show bounding box for quick sanity check
-        decision = show_bbox_preview(first_frame, bbox, phrase)
+        decision = show_bbox_preview(seed_frame, bbox, phrase)
         if decision == "cancel":
             raise SystemExit("Selection cancelled.")
         elif decision == "redo":
@@ -393,26 +446,24 @@ def _select_mask(args: argparse.Namespace, first_frame: np.ndarray) -> np.ndarra
             continue
 
         # Bounding box accepted → run SAM2
-        mask = get_mask_from_bbox(sam, first_frame, bbox)
+        mask = get_mask_from_bbox(sam, seed_frame, bbox)
 
         # Show full mask preview
-        decision = confirm_mask(first_frame, mask, f'"{phrase}"')
+        decision = confirm_mask(seed_frame, mask, f'"{phrase}"')
         if decision == "accept":
             break
         elif decision == "cancel":
             raise SystemExit("Selection cancelled.")
         elif decision == "refine":
-            # Let user click a better point inside the object
-            pt = select_click_point(first_frame)
+            pt = select_click_point(seed_frame)
             if pt:
                 from sam_load import get_mask_from_click
-                mask = get_mask_from_click(sam, first_frame, pt[0], pt[1])
-                decision2 = confirm_mask(first_frame, mask, "refined")
+                mask = get_mask_from_click(sam, seed_frame, pt[0], pt[1])
+                decision2 = confirm_mask(seed_frame, mask, "refined")
                 if decision2 == "accept":
                     break
                 elif decision2 == "cancel":
                     raise SystemExit("Selection cancelled.")
-                # "redo" → outer loop restarts
             mask = None  # redo
         else:  # "redo"
             mask = None
@@ -423,12 +474,12 @@ def _select_mask(args: argparse.Namespace, first_frame: np.ndarray) -> np.ndarra
         # Fallback: manual click
         print("  Falling back to click mode…")
         while True:
-            pt = select_click_point(first_frame)
+            pt = select_click_point(seed_frame)
             if pt is None:
                 raise SystemExit("Selection cancelled.")
             from sam_load import get_mask_from_click
-            mask = get_mask_from_click(sam, first_frame, pt[0], pt[1])
-            decision = confirm_mask(first_frame, mask, "click fallback")
+            mask = get_mask_from_click(sam, seed_frame, pt[0], pt[1])
+            decision = confirm_mask(seed_frame, mask, "click fallback")
             if decision == "accept":
                 break
             elif decision == "cancel":
@@ -436,7 +487,7 @@ def _select_mask(args: argparse.Namespace, first_frame: np.ndarray) -> np.ndarra
 
     del gdino, sam
     torch.cuda.empty_cache()
-    return mask
+    return mask, seed_idx
 
 
 # ──────────────────────────────────────────────
@@ -477,6 +528,12 @@ def parse_args() -> argparse.Namespace:
             "Defaults to the first two words of --prompt if not set."
         ),
     )
+    p.add_argument("--box-threshold",  type=float, default=0.35,
+                   help="Grounding DINO box confidence threshold (lower = more detections)")
+    p.add_argument("--text-threshold", type=float, default=0.25,
+                   help="Grounding DINO text similarity threshold (lower = more detections)")
+    p.add_argument("--scan-frames",    type=int,   default=10,
+                   help="In text/auto mode: scan first N frames if object not on frame 0")
 
     # Diffusion
     p.add_argument("--prompt",          default=DEFAULT_PROMPT)
@@ -496,9 +553,9 @@ def parse_args() -> argparse.Namespace:
 
     # Model paths
     p.add_argument("--sam2-checkpoint", default="sam2_hiera_large.pt")
-    p.add_argument("--sam2-config",     default="sam2_hiera_l.yaml")
-    p.add_argument("--gdino-config",
-                   default="GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py")
+    p.add_argument("--sam2-config",     default="configs/sam2.1/sam2.1_hiera_l.yaml")
+    p.add_argument("--gdino-config", default=None,
+                   help="Path to Grounding DINO config (auto-detected from installed package if not set)")
     p.add_argument("--gdino-checkpoint", default="groundingdino_swint_ogc.pth")
 
     return p.parse_args()
@@ -515,11 +572,32 @@ def main() -> None:
 
     print(f"Device: {DEVICE}  |  dtype: {DTYPE}")
 
-    # ── Pipeline ──────────────────────────────
+    # ── 1. Frame extraction (first — frees us to plan memory) ─────────────
+    print(f"Extracting frames from '{args.input}'…")
+    frames, fps = extract_frames(args.input)
+    print(f"  {len(frames)} frames @ {fps:.2f} FPS")
+
+    # ── 2. Initial mask via SAM2 image + GroundingDINO ────────────────────
+    initial_mask, seed_frame_idx = _select_mask(args, frames)
+
+    # ── 3. SAM2 Video Predictor — track mask through all frames ───────────
+    print("Tracking object through all frames with SAM2 Video Predictor…")
+    from sam_video import build_video_predictor, track_masks_video
+
+    video_predictor = build_video_predictor(
+        args.sam2_checkpoint, args.sam2_config, device=DEVICE
+    )
+    tracked_masks = track_masks_video(video_predictor, frames, initial_mask, initial_frame_idx=seed_frame_idx)
+    del video_predictor
+    torch.cuda.empty_cache()
+    print(f"  Tracking done. "
+          f"Object present in {sum(m.any() for m in tracked_masks)}/{len(frames)} frames.")
+
+    # ── 4. Diffusion pipeline (loaded after SAM2 is freed) ────────────────
     print("Loading diffusion pipeline…")
     pipe, depth_detector = load_pipeline(args.multi_controlnet)
 
-    # ── RAFT (optional) ───────────────────────
+    # ── 5. RAFT (optional, for temporal blending only) ────────────────────
     raft_model = None
     if args.use_raft:
         try:
@@ -529,29 +607,29 @@ def main() -> None:
         except Exception as e:
             print(f"RAFT unavailable ({e}), falling back to Farneback.")
 
-    # ── Frame extraction ──────────────────────
-    print(f"Extracting frames from '{args.input}'…")
-    frames, fps = extract_frames(args.input)
-    print(f"  {len(frames)} frames @ {fps:.2f} FPS")
-
-    # ── Object selection → initial mask ───────
-    mask = _select_mask(args, frames[0])
-
-    # ── Frame loop ────────────────────────────
+    # ── 6. Frame loop ─────────────────────────────────────────────────────
     prev_result: np.ndarray | None = None
     processed: list[np.ndarray] = []
 
     for i, frame in enumerate(frames):
         print(f"  Frame {i + 1}/{len(frames)}", end="\r", flush=True)
 
-        # Mask tracking via optical flow
+        # Use SAM2-tracked mask (replaces optical flow mask warping)
+        mask = tracked_masks[i]
+
+        # Skip frames where object is not visible — no diffusion needed
+        if not mask.any():
+            processed.append(frame.copy())
+            prev_result = None  # reset temporal state on gap
+            continue
+
+        # Optical flow — only for temporal blending on frames with the object
         if i > 0:
             if raft_model is not None:
                 from raft_load import compute_flow_raft
                 flow = compute_flow_raft(raft_model, frames[i - 1], frame)
             else:
                 flow = compute_flow_farneback(frames[i - 1], frame)
-            mask = warp_mask(mask, flow).clip(0, 255).astype(np.uint8)
         else:
             flow = None
 
@@ -563,18 +641,18 @@ def main() -> None:
         else:
             control_image = canny
 
-        # SDXL inpainting ─ fix: no latents hand-off (was broken); use frame blending instead
+        # SDXL inpainting
         inpainted = inpaint_frame(
             pipe, frame, mask, control_image,
             args.prompt, args.negative_prompt, seed=args.seed,
         )
 
-        # Temporal consistency (post-process blending, not diffusion latents)
+        # Temporal consistency
         inpainted = apply_temporal_consistency(
             inpainted, prev_result, mask, flow, alpha=args.blend_alpha
         )
 
-        # Relighting / color harmonization
+        # Color harmonization
         inpainted = color_harmonize(frame, inpainted, mask)
 
         # Grain matching
@@ -590,7 +668,7 @@ def main() -> None:
 
     print()  # newline after \r progress
 
-    # ── Assembly ──────────────────────────────
+    # ── 7. Assembly ───────────────────────────────────────────────────────
     print(f"Assembling '{args.output}'…")
     assemble_video(processed, args.output, fps=fps)
     print("Done.")

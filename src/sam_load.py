@@ -1,7 +1,7 @@
 import numpy as np
 
 SAM2_CHECKPOINT = "sam2_hiera_large.pt"
-SAM2_CONFIG = "sam2_hiera_l.yaml"
+SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 
 
 def build_sam2_predictor(
