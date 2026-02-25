@@ -54,3 +54,10 @@ Thumbs.db
 *.log
 tmp/
 temp/
+
+
+# Презентация
+pitch_deck.pdf
+pitch_deck.pptx
+pitch_deck.docx
+pitch_deck.html
