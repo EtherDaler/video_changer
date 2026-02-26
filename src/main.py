@@ -186,9 +186,12 @@ def load_pipeline(
         print("  Memory mode: sequential CPU offload (~3 GB VRAM)")
     elif cpu_offload:
         pipe.enable_model_cpu_offload()
-        print("  Memory mode: model CPU offload (~4 GB VRAM)")
+        print("  Memory mode: model CPU offload (~4 GB VRAM, slower PCIe transfers)")
     else:
         pipe = pipe.to(device)
+
+    # VAE slicing: decode latent rows one at a time → less peak VRAM, no quality loss
+    pipe.enable_vae_slicing()
 
     _configure_attention(pipe, device, attention_slicing)
 
@@ -1066,15 +1069,17 @@ def main() -> None:
             # Blackwell: needs PyTorch 2.7+cu128 for native support
             pt_major = int(pt_ver.split(".")[0])
             pt_minor = int(pt_ver.split(".")[1].split("+")[0].split("a")[0].split("b")[0])
-            has_native = (pt_major, pt_minor) >= (2, 7) and "cu128" in pt_ver
+            has_cu128 = "cu128" in pt_ver and (pt_major, pt_minor) >= (2, 7)
+            has_cu130 = "cu130" in pt_ver  # nightly cu130 also fully supports Blackwell
+            has_native = has_cu128 or has_cu130
             if has_native:
-                attention_note = "PyTorch 2.7+cu128 — Blackwell natively supported ✓"
+                attention_note = f"PyTorch {pt_ver} — Blackwell natively supported ✓"
             else:
                 attention_note = (
                     f"PyTorch {pt_ver} does NOT support sm_{cap[0]}{cap[1]} natively — "
                     "all CUDA ops fall back → extremely slow (30+ min/frame). "
                     "FIX: pip uninstall torch torchvision torchaudio -y && "
-                    "pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128"
+                    "pip install torch --pre --index-url https://download.pytorch.org/whl/nightly/cu130"
                 )
         else:
             attention_note = "supported"
@@ -1082,6 +1087,31 @@ def main() -> None:
         print(f"  GPU: {name}  sm_{cap[0]}{cap[1]}  PyTorch {pt_ver}  CUDA {cuda_ver}")
         if cap[0] >= 12:
             print(f"  Blackwell status: {attention_note}")
+
+        # VRAM advice: tell user whether --cpu-offload is needed
+        try:
+            total_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            # bf16 SDXL UNet ~2.6 GB, ControlNet ~1.25 GB, VAE ~0.15 GB ≈ 4.0 GB
+            # ip-adapter adds ~0.5 GB; leave 2 GB headroom for activations
+            recommended_min = 6.0
+            if total_vram_gb >= recommended_min:
+                if args.cpu_offload or args.sequential_offload:
+                    print(
+                        f"  VRAM: {total_vram_gb:.1f} GB — enough to run WITHOUT --cpu-offload. "
+                        "CPU offload transfers weights over PCIe each step → much slower. "
+                        "Try removing --cpu-offload for a large speed-up."
+                    )
+                else:
+                    print(f"  VRAM: {total_vram_gb:.1f} GB — direct GPU mode (fastest) ✓")
+            else:
+                if not (args.cpu_offload or args.sequential_offload):
+                    print(
+                        f"  VRAM: {total_vram_gb:.1f} GB — low VRAM; add --cpu-offload if you get OOM errors"
+                    )
+                else:
+                    print(f"  VRAM: {total_vram_gb:.1f} GB — CPU offload enabled")
+        except Exception:
+            pass
 
     # ── 1. Frame extraction (first — frees us to plan memory) ─────────────
     print(f"Extracting frames from '{args.input}'…")

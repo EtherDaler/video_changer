@@ -55,14 +55,17 @@ AI-инструмент для замены объектов на видео: н
 | Режим | VRAM / RAM | Флаг | Время/кадр |
 |-------|-----------|------|-----------|
 | CUDA, 16+ GB VRAM | полная загрузка | *(нет)* | ~5-10 сек |
-| CUDA, 8 GB VRAM | CPU offload | `--cpu-offload` | ~15-25 сек |
+| CUDA, 8 GB VRAM (Blackwell bf16) | прямой GPU | *(нет)* | ~10-20 сек |
+| CUDA, 8 GB VRAM (другие GPU fp16) | CPU offload | `--cpu-offload` | ~15-25 сек |
 | CUDA, 6 GB VRAM | Sequential offload | `--sequential-offload` | ~30-60 сек |
 | MPS (Apple Silicon) | 16 GB unified | *(авто)* | ~3 мин |
 | CPU | 32 GB RAM | *(авто)* | ~10-20 мин |
 
-> **RTX 5060 / 3060 / 4060 (8 GB)**: добавь `--cpu-offload`. SDXL+ControlNet+IP-Adapter суммарно требуют ~8 GB, CPU offload снижает пиковое потребление до ~4 GB.
+> **RTX 5060 / 5070 (8 GB, Blackwell)**: после переустановки PyTorch cu128/cu130 и автоматического bf16 модели занимают ~4 GB — `--cpu-offload` **не нужен**. Запускай без него для максимальной скорости.
 >
-> **xformers** (только NVIDIA): установи `pip install xformers` для дополнительного снижения VRAM на ~15-20%.
+> **RTX 3060 / 4060 (8 GB, fp16)**: добавь `--cpu-offload`. SDXL+ControlNet+IP-Adapter суммарно требуют ~8 GB в fp16.
+>
+> **xformers** (только NVIDIA не-Blackwell): установи `pip install xformers` для снижения VRAM на ~15-20%. На Blackwell программа использует PyTorch встроенный SDPA — xformers не нужен.
 >
 > На macOS MPS SDXL обрабатывает ~3 мин/кадр. Для быстрой проверки используй `--steps 10`.
 
@@ -75,25 +78,26 @@ RTX 5000-й серии использует архитектуру **Blackwell (
 GPU: NVIDIA GeForce RTX 5060 (sm_120) — sm_120 NOT in PyTorch Flash Attention list
 ```
 
-**Правильное решение — переустановить PyTorch 2.7 с CUDA 12.8:**
+**Правильное решение — переустановить PyTorch с CUDA 12.8 или 13.0:**
+
+> У тебя NVIDIA-SMI показывает `CUDA Version: 13.0` — это максимальная версия, которую поддерживает **драйвер**. PyTorch cu128 и cu130 оба совместимы с этим драйвером.
 
 ```bash
 # Удалить старый PyTorch и xformers
 pip uninstall torch torchvision torchaudio xformers -y
 
-# Установить PyTorch 2.7 — первый стабильный релиз с официальной поддержкой Blackwell
-# Включает: Triton 3.3 (torch.compile для sm_120), cuDNN и CUTLASS для Blackwell
+# Вариант A: PyTorch 2.7 стабильный + CUDA 12.8 (рекомендован)
 pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-# Опционально: xformers с CUTLASS Blackwell (версия 0.0.33+)
-# Если установка падает — пропустить, встроенный SDPA достаточен
-pip install xformers --index-url https://download.pytorch.org/whl/cu128
+# Вариант B: PyTorch nightly + CUDA 13.0 (нативен для твоего драйвера, может быть быстрее)
+pip install torch --pre --index-url https://download.pytorch.org/whl/nightly/cu130
 ```
 
 После установки программа сама:
 - переключится на bfloat16 (нативная поддержка Blackwell, стабильнее fp16)
 - выберет PyTorch встроенный SDPA вместо xformers (оптимальный путь для Blackwell)
-- выведет диагностику: `Blackwell status: PyTorch 2.7+cu128 — Blackwell natively supported ✓`
+- выведет диагностику: `Blackwell status: PyTorch X.Y+cu128/cu130 — Blackwell natively supported ✓`
+- предупредит если `--cpu-offload` не нужен при 8 GB VRAM
 
 **Временное решение (без переустановки) — флаг `--torch-compile`:**
 
@@ -426,9 +430,10 @@ python src/main.py \
   --shadow-opacity 0
 ```
 
-### RTX 5060 / 5070 / 5080 / 5090 (Blackwell, после установки PyTorch 2.7+cu128)
+### RTX 5060 / 5070 / 5080 / 5090 (Blackwell, после установки PyTorch cu128 или cu130)
 
 ```bash
+# Без --cpu-offload: в bf16 модели занимают ~4 GB → всё умещается в 8 GB VRAM
 python src/main.py \
   --input  videos/input.mp4 \
   --output videos/output.mp4 \
@@ -436,14 +441,14 @@ python src/main.py \
   --detect-prompt "mug" \
   --prompt "ceramic mug with space galaxy design, photorealistic" \
   --steps  20 \
-  --width  768 --height 768 \
-  --cpu-offload
+  --width  768 --height 768
 ```
 
-> После установки `pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128`:
-> - флаги `--attention-slicing` и `--torch-compile` не нужны
+> После установки cu128/cu130:
+> - `--cpu-offload` **не нужен** — без него быстрее (нет PCIe-трансферов каждый шаг)
 > - bfloat16 включается автоматически (нативная поддержка Blackwell)
-> - программа выведет: `Blackwell status: PyTorch 2.7+cu128 — Blackwell natively supported ✓`
+> - программа выведет: `Blackwell status: PyTorch X.Y+cu1XX — Blackwell natively supported ✓`
+> - если всё равно OOM — добавь `--no-ip-adapter` (освобождает ~0.5 GB)
 
 ### Принудительно указать устройство
 
@@ -557,7 +562,12 @@ python src/main.py --device cpu ...
 
 ### `CUDA out of memory`
 
-На 8 GB GPU (RTX 3060/4060/5060) — включи CPU offload:
+**RTX 5060 / 5070 (Blackwell, 8 GB):** После переустановки PyTorch cu128/cu130 модели в bf16 занимают ~4 GB. `--cpu-offload` **не нужен** — запускай без него. Если всё равно OOM:
+```bash
+python src/main.py --no-ip-adapter ...
+```
+
+**RTX 3060 / 4060 (8 GB, fp16)** — включи CPU offload:
 ```bash
 python src/main.py --cpu-offload ...
 ```
