@@ -330,10 +330,22 @@ def synthesize_shadow(
 # INPAINTING  (with optional IP-Adapter)
 # ──────────────────────────────────────────────
 
-def load_ip_adapter(pipe, scale: float = 0.6) -> bool:
+def load_ip_adapter(
+    pipe,
+    scale: float = 0.6,
+    device: str = DEVICE,
+    dtype: torch.dtype = DTYPE,
+    cpu_offload: bool = False,
+    sequential_offload: bool = False,
+) -> bool:
     """
     Load IP-Adapter SDXL weights into *pipe* for appearance-guided generation.
     Returns True on success, False if unavailable (network / weight issue).
+
+    diffusers adds pipe.image_encoder *after* the pipeline is already on the
+    GPU, so it lands on CPU by default and causes a device-mismatch error.
+    We fix this by explicitly moving it to the correct device, or by
+    re-applying the offloading hooks when memory offloading is active.
     """
     try:
         pipe.load_ip_adapter(
@@ -342,6 +354,17 @@ def load_ip_adapter(pipe, scale: float = 0.6) -> bool:
             weight_name="ip-adapter_sdxl.bin",
         )
         pipe.set_ip_adapter_scale(scale)
+
+        if sequential_offload:
+            # Re-apply hooks so the newly added image_encoder is also covered.
+            pipe.enable_sequential_cpu_offload()
+        elif cpu_offload:
+            pipe.enable_model_cpu_offload()
+        else:
+            # No offloading: move image_encoder to the same device/dtype as the rest.
+            if getattr(pipe, "image_encoder", None) is not None:
+                pipe.image_encoder = pipe.image_encoder.to(device=device, dtype=dtype)
+
         print(f"  IP-Adapter loaded  (scale={scale})")
         return True
     except Exception as e:
@@ -927,7 +950,14 @@ def main() -> None:
     # IP-Adapter: load weights so first inpainted frame can guide all others
     ip_adapter_ok = False
     if not args.no_ip_adapter:
-        ip_adapter_ok = load_ip_adapter(pipe, scale=args.ip_adapter_scale)
+        ip_adapter_ok = load_ip_adapter(
+            pipe,
+            scale=args.ip_adapter_scale,
+            device=DEVICE,
+            dtype=DTYPE,
+            cpu_offload=args.cpu_offload,
+            sequential_offload=args.sequential_offload,
+        )
 
     # ── 5. RAFT (optional, for temporal blending only) ────────────────────
     raft_model = None
