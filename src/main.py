@@ -39,6 +39,19 @@ HEIGHT = 1024
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32       = True
 
+
+def _cuda_sm() -> tuple[int, int] | None:
+    """Return (major, minor) compute capability of GPU 0, or None if not CUDA."""
+    if torch.cuda.is_available():
+        return torch.cuda.get_device_capability(0)
+    return None
+
+
+def _is_blackwell() -> bool:
+    """True when running on NVIDIA Blackwell (sm_120, RTX 5000-series)."""
+    sm = _cuda_sm()
+    return sm is not None and sm[0] >= 12
+
 DEFAULT_PROMPT = (
     "realistic printed photo on ceramic mug surface, matching lighting"
 )
@@ -51,24 +64,71 @@ DEFAULT_NEG_PROMPT = (
 # PIPELINE LOADING
 # ──────────────────────────────────────────────
 
+def _configure_attention(pipe, device: str, attention_slicing: bool) -> None:
+    """
+    Choose the best attention backend for the current GPU.
+
+    Strategy:
+      • Blackwell (sm_120+, RTX 5060/5070/5080/5090):
+          xformers pre-0.0.33 has no Blackwell CUTLASS kernels and causes slowdowns.
+          We force PyTorch's native scaled_dot_product_attention (AttnProcessor2_0)
+          which works out-of-the-box with PyTorch 2.7+cu128.
+
+      • Other NVIDIA GPUs:
+          Try xformers first (15-20% VRAM savings). If not installed, SDPA is used
+          automatically by diffusers ≥0.20 with PyTorch 2.x.
+
+      • attention_slicing: always applied on top, further chunked memory access.
+    """
+    if device != "cuda":
+        if attention_slicing:
+            pipe.enable_attention_slicing(1)
+            print("  Attention slicing enabled")
+        return
+
+    if _is_blackwell():
+        # On Blackwell: use PyTorch 2.x built-in SDPA (AttnProcessor2_0).
+        # xformers < 0.0.33 lacks Blackwell CUTLASS kernels and may be slower
+        # than native SDPA or cause CUDA errors.
+        try:
+            from diffusers.models.attention_processor import AttnProcessor2_0
+            pipe.unet.set_attn_processor(AttnProcessor2_0())
+            print("  Attention: PyTorch SDPA (AttnProcessor2_0) — optimal for Blackwell")
+        except Exception as e:
+            print(f"  Attention: SDPA (AttnProcessor2_0 unavailable: {e})")
+    else:
+        # Non-Blackwell NVIDIA: prefer xformers for VRAM savings
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            print("  Attention: xformers memory-efficient")
+        except Exception:
+            print("  Attention: PyTorch SDPA (xformers not installed)")
+
+    if attention_slicing:
+        pipe.enable_attention_slicing(1)
+        print("  Attention slicing enabled")
+
+
 def _apply_torch_compile(pipe) -> None:
     """
     JIT-compile the UNet (and optionally VAE decoder) with torch.compile.
 
-    On new GPU architectures (e.g. Blackwell sm_120) where PyTorch ships without
-    pre-built Flash Attention kernels, torch.compile generates optimised Triton
-    kernels at runtime for the exact device, recovering most of the speed lost
-    by the unoptimised fallback.
+    PyTorch 2.7 ships Triton 3.3 which adds Blackwell (sm_120) support, so
+    torch.compile works correctly on RTX 5060+ when using cu128.
 
-    First inference will be slower (compilation warm-up ~2-5 min), every
-    subsequent frame runs at full compiled speed.
+    NOTE: CUDA 12.8/12.9 has a known missing libnvptxcompiler.so issue that
+    breaks JIT PTX compilation. If torch.compile fails, we fall back silently.
+    Warm-up on first frame: 2-5 min. All subsequent frames run at native speed.
     """
+    # On Blackwell use "default" mode — "reduce-overhead" uses CUDA graphs
+    # which can trigger the JIT PTX bug on CUDA 12.8; "default" is safer.
+    mode = "default" if _is_blackwell() else "reduce-overhead"
     try:
-        print("  torch.compile: compiling UNet (first frame will be slow — warm-up)…")
-        pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=False)
+        print(f"  torch.compile: compiling UNet (mode={mode}, first frame = warm-up ~2-5 min)…")
+        pipe.unet = torch.compile(pipe.unet, mode=mode, fullgraph=False)
         # VAE decode is also in the hot path; compile it too
         if hasattr(pipe, "vae"):
-            pipe.vae.decode = torch.compile(pipe.vae.decode, mode="reduce-overhead", fullgraph=False)
+            pipe.vae.decode = torch.compile(pipe.vae.decode, mode=mode, fullgraph=False)
         print("  torch.compile ready")
     except Exception as e:
         print(f"  torch.compile skipped ({e})")
@@ -129,18 +189,8 @@ def load_pipeline(
         print("  Memory mode: model CPU offload (~4 GB VRAM)")
     else:
         pipe = pipe.to(device)
-        # xformers gives ~15-20% VRAM reduction on NVIDIA via memory-efficient attention
-        try:
-            pipe.enable_xformers_memory_efficient_attention()
-            print("  xformers memory-efficient attention enabled")
-        except Exception:
-            pass
 
-    if attention_slicing:
-        # Chunked attention: slower on well-supported GPUs, but the only
-        # efficient path on architectures where Flash Attention isn't compiled in.
-        pipe.enable_attention_slicing(1)
-        print("  Attention slicing enabled")
+    _configure_attention(pipe, device, attention_slicing)
 
     if torch_compile:
         _apply_torch_compile(pipe)
@@ -873,6 +923,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", default="output.mp4", help="Output video path")
     p.add_argument("--device", default=None,
                    help="Compute device: cuda | mps | cpu (auto-detected by default)")
+    p.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default=None,
+                   help=(
+                       "Model weight dtype. Default: fp16 on GPU, fp32 on CPU. "
+                       "bf16 is recommended for Blackwell (RTX 5060+) — native hardware "
+                       "support, same speed as fp16 but more numerically stable."
+                   ))
 
     # ── Selection mode ──────────────────────────────────────────────────────
     p.add_argument(
@@ -975,10 +1031,22 @@ def main() -> None:
     args = parse_args()
 
     # Override device / dtype if explicitly requested
+    global DEVICE, DTYPE
     if args.device:
-        global DEVICE, DTYPE
         DEVICE = args.device
         DTYPE = torch.float32 if DEVICE == "cpu" else torch.float16
+
+    if args.dtype == "bf16":
+        DTYPE = torch.bfloat16
+    elif args.dtype == "fp32":
+        DTYPE = torch.float32
+    elif args.dtype == "fp16":
+        DTYPE = torch.float16
+    elif _is_blackwell() and DTYPE == torch.float16:
+        # Auto-switch to bfloat16 on Blackwell — native hardware support,
+        # avoids rare fp16 NaN issues, same throughput
+        DTYPE = torch.bfloat16
+        print("  Auto: switched to bfloat16 (native Blackwell hardware)")
 
     # Apply resolution override (must happen before frame extraction)
     global WIDTH, HEIGHT
@@ -987,18 +1055,33 @@ def main() -> None:
 
     print(f"Device: {DEVICE}  |  dtype: {DTYPE}  |  resolution: {WIDTH}×{HEIGHT}")
 
-    # Print CUDA capability so users can see if their GPU is in the supported list
+    # CUDA diagnostics: GPU capability, PyTorch version, attention backend status
     if DEVICE == "cuda" and torch.cuda.is_available():
         cap = torch.cuda.get_device_capability()
         name = torch.cuda.get_device_name(0)
-        # PyTorch ships Flash Attention kernels for sm_50..sm_90; sm_120 (Blackwell) needs nightly/cu128
-        supported = cap[0] <= 9
-        attention_note = "Flash Attention supported" if supported else (
-            f"sm_{cap[0]}{cap[1]} NOT in PyTorch Flash Attention list — "
-            "attention falls back to slow O(n²) math. "
-            "Fix: pip install torch --index-url https://download.pytorch.org/whl/cu128"
-        )
-        print(f"  GPU: {name} (sm_{cap[0]}{cap[1]}) — {attention_note}")
+        pt_ver = torch.__version__
+        cuda_ver = torch.version.cuda or "?"
+
+        if cap[0] >= 12:
+            # Blackwell: needs PyTorch 2.7+cu128 for native support
+            pt_major = int(pt_ver.split(".")[0])
+            pt_minor = int(pt_ver.split(".")[1].split("+")[0].split("a")[0].split("b")[0])
+            has_native = (pt_major, pt_minor) >= (2, 7) and "cu128" in pt_ver
+            if has_native:
+                attention_note = "PyTorch 2.7+cu128 — Blackwell natively supported ✓"
+            else:
+                attention_note = (
+                    f"PyTorch {pt_ver} does NOT support sm_{cap[0]}{cap[1]} natively — "
+                    "all CUDA ops fall back → extremely slow (30+ min/frame). "
+                    "FIX: pip uninstall torch torchvision torchaudio -y && "
+                    "pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128"
+                )
+        else:
+            attention_note = "supported"
+
+        print(f"  GPU: {name}  sm_{cap[0]}{cap[1]}  PyTorch {pt_ver}  CUDA {cuda_ver}")
+        if cap[0] >= 12:
+            print(f"  Blackwell status: {attention_note}")
 
     # ── 1. Frame extraction (first — frees us to plan memory) ─────────────
     print(f"Extracting frames from '{args.input}'…")

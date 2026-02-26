@@ -75,15 +75,25 @@ RTX 5000-й серии использует архитектуру **Blackwell (
 GPU: NVIDIA GeForce RTX 5060 (sm_120) — sm_120 NOT in PyTorch Flash Attention list
 ```
 
-**Правильное решение — переустановить PyTorch с CUDA 12.8:**
+**Правильное решение — переустановить PyTorch 2.7 с CUDA 12.8:**
 
 ```bash
-# Удалить старый PyTorch
-pip uninstall torch torchvision torchaudio -y
+# Удалить старый PyTorch и xformers
+pip uninstall torch torchvision torchaudio xformers -y
 
-# Установить версию с поддержкой Blackwell (sm_120)
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+# Установить PyTorch 2.7 — первый стабильный релиз с официальной поддержкой Blackwell
+# Включает: Triton 3.3 (torch.compile для sm_120), cuDNN и CUTLASS для Blackwell
+pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Опционально: xformers с CUTLASS Blackwell (версия 0.0.33+)
+# Если установка падает — пропустить, встроенный SDPA достаточен
+pip install xformers --index-url https://download.pytorch.org/whl/cu128
 ```
+
+После установки программа сама:
+- переключится на bfloat16 (нативная поддержка Blackwell, стабильнее fp16)
+- выберет PyTorch встроенный SDPA вместо xformers (оптимальный путь для Blackwell)
+- выведет диагностику: `Blackwell status: PyTorch 2.7+cu128 — Blackwell natively supported ✓`
 
 **Временное решение (без переустановки) — флаг `--torch-compile`:**
 
@@ -91,7 +101,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 python src/main.py ... --torch-compile --width 768 --height 768 --steps 20
 ```
 
-`torch.compile` JIT-компилирует UNet под конкретную GPU во время первого прогона (2-5 минут), после чего все следующие кадры обрабатываются с нативной скоростью. Без него на Blackwell каждый кадр медленный.
+`torch.compile` JIT-компилирует UNet под конкретную GPU. Работает только с PyTorch 2.7+cu128 (Triton 3.3). Первый кадр: 2-5 мин warm-up, остальные — нативная скорость.
 
 ---
 
@@ -165,10 +175,12 @@ myvenv\Scripts\Activate.ps1
 
 Выбери команду под своё железо:
 
-#### CUDA 12.8 (Linux / Windows, RTX 5000-й серии — Blackwell sm_120) ← **рекомендуется для RTX 5060/5070/5080/5090**
+#### CUDA 12.8 + PyTorch 2.7 (RTX 5000-й серии — Blackwell sm_120) ← **рекомендуется для RTX 5060/5070/5080/5090**
+
+PyTorch 2.7 — первый стабильный релиз с нативной поддержкой Blackwell (Triton 3.3, cuDNN, CUTLASS):
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 ```
 
 #### CUDA 12.1 (Linux / Windows, RTX 3000/4000-й серии)
@@ -414,7 +426,7 @@ python src/main.py \
   --shadow-opacity 0
 ```
 
-### RTX 5060 / 5070 / 5080 / 5090 (после установки CUDA 12.8)
+### RTX 5060 / 5070 / 5080 / 5090 (Blackwell, после установки PyTorch 2.7+cu128)
 
 ```bash
 python src/main.py \
@@ -428,7 +440,10 @@ python src/main.py \
   --cpu-offload
 ```
 
-> После установки PyTorch с CUDA 12.8 (`--index-url https://download.pytorch.org/whl/cu128`) флаги `--attention-slicing` и `--torch-compile` не нужны — Flash Attention работает нативно.
+> После установки `pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128`:
+> - флаги `--attention-slicing` и `--torch-compile` не нужны
+> - bfloat16 включается автоматически (нативная поддержка Blackwell)
+> - программа выведет: `Blackwell status: PyTorch 2.7+cu128 — Blackwell natively supported ✓`
 
 ### Принудительно указать устройство
 
@@ -454,6 +469,7 @@ python src/main.py --device cpu ...
 | `--input` | `input.mp4` | Входное видео |
 | `--output` | `output.mp4` | Выходное видео |
 | `--device` | *(авто)* | `cuda` / `mps` / `cpu` |
+| `--dtype` | *(авто)* | Тип весов модели: `fp16`, `bf16`, `fp32`. На Blackwell автоматически выбирается `bf16` |
 
 ### Выбор объекта
 
