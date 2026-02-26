@@ -64,7 +64,11 @@ def load_pipeline(
     """
     if use_multi_controlnet:
         from multy_control_net import build_multi_controlnet_pipe
-        return build_multi_controlnet_pipe(dtype, device)
+        return build_multi_controlnet_pipe(
+            dtype, device,
+            cpu_offload=cpu_offload,
+            sequential_offload=sequential_offload,
+        )
 
     controlnet: ControlNetModel = ControlNetModel.from_pretrained(  # type: ignore[assignment]
         "diffusers/controlnet-canny-sdxl-1.0",
@@ -975,9 +979,18 @@ def main() -> None:
             scene_lighting = analyze_scene_lighting(frame, mask)
 
         # ── SDXL inpainting ──────────────────────────────────────────────
-        # First frame: no IP-Adapter reference yet → generate freely.
-        # All subsequent frames: pass the first inpainted result as the
-        # IP-Adapter reference so appearance stays consistent across frames.
+        # Once IP-Adapter is loaded the UNet *always* needs image_embeds.
+        # For the first frame there is no reference yet, so we set scale=0
+        # and pass the current frame as a neutral placeholder (zero influence).
+        # From the second frame onward the real reference is used at full scale.
+        if ip_adapter_ok and ip_reference is None:
+            pipe.set_ip_adapter_scale(0.0)
+            ip_placeholder: Image.Image | None = Image.fromarray(frame)
+        else:
+            if ip_adapter_ok:
+                pipe.set_ip_adapter_scale(args.ip_adapter_scale)
+            ip_placeholder = None
+
         inpainted = inpaint_frame(
             pipe, frame, mask, control_image,
             args.prompt, args.negative_prompt,
@@ -985,7 +998,7 @@ def main() -> None:
             steps=args.steps,
             guidance_scale=args.guidance_scale,
             feather_radius=args.feather_radius,
-            ip_adapter_image=ip_reference if ip_adapter_ok else None,
+            ip_adapter_image=(ip_reference if ip_reference is not None else ip_placeholder) if ip_adapter_ok else None,
             extra_prompt_terms=scene_lighting,
         )
 

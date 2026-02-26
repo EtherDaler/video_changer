@@ -64,12 +64,27 @@ def track_masks_video(
 
             tracked: list[np.ndarray | None] = [None] * n
 
-            for out_idx, obj_ids, logits in predictor.propagate_in_video(state):
-                if 1 not in obj_ids:
-                    continue
-                ch = list(obj_ids).index(1)
-                binary = (logits[ch] > 0.0).squeeze(0).cpu().numpy()
-                tracked[out_idx] = binary.astype(np.uint8) * 255
+            def _collect(gen) -> None:
+                for out_idx, obj_ids, logits in gen:
+                    if tracked[out_idx] is not None:
+                        continue  # forward pass already set this frame
+                    obj_ids_list = [int(x) for x in obj_ids]
+                    if 1 not in obj_ids_list:
+                        continue
+                    ch = obj_ids_list.index(1)
+                    binary = (logits[ch] > 0.0).squeeze(0).cpu().numpy()
+                    tracked[out_idx] = binary.astype(np.uint8) * 255
+
+            # Forward pass: seed frame → last frame
+            _collect(predictor.propagate_in_video(state))
+
+            # Backward pass: seed frame → first frame (only needed when seed > 0)
+            if initial_frame_idx > 0:
+                try:
+                    _collect(predictor.propagate_in_video(state, reverse=True))
+                except TypeError:
+                    # Older SAM2 versions may not support reverse=True
+                    pass
 
     # Fill frames where SAM2 found nothing with an empty mask.
     empty = np.zeros(initial_mask.shape, dtype=np.uint8)
