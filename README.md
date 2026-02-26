@@ -7,19 +7,38 @@ AI-инструмент для замены объектов на видео: н
 ```
 Видео
   → Извлечение кадров
-  → Детекция объекта (Grounding DINO или клик)
+  → Детекция объекта: Grounding DINO сканирует N равномерных кадров,
+    берёт детекцию с максимальным confidence (не первую найденную)
   → Начальная маска (SAM2 Image Predictor)
   → Трекинг маски по всему видео (SAM2 Video Predictor)
+    + заполнение 1-2 кадровых пробелов (drop-out compensation)
   → Для кадров с объектом:
+      → Анализ освещения сцены → авто-дополнение промпта
       → ControlNet (Canny [+ Depth])
-      → Inpainting SDXL
+      → SDXL Inpainting (мягкая маска + IP-Adapter референс)
+      → Poisson seamless blending (бесшовный стык)
       → Temporal consistency (optical flow)
-      → Цветовая гармонизация
+      → Синтетическая тень (по оценённому направлению света)
+      → Цветовая гармонизация (LAB)
       → Совпадение зернистости и motion blur
   → Сборка видео
 ```
 
-> Кадры без объекта (объект вышел за край кадра, перекрыт и т.д.) копируются без обработки — диффузионная модель на них не запускается.
+> Кадры без объекта копируются без обработки — диффузионная модель на них не запускается.
+
+### Что делает результат реалистичным
+
+| Техника | Что решает |
+|---------|-----------|
+| **IP-Adapter reference** | Все кадры генерируются с одинаковой текстурой/стилем (первый кадр → референс) |
+| **Авто-анализ освещения** | SDXL получает описание яркости, цветовой температуры и контраста сцены |
+| **Мягкая маска** | Gaussian feathering убирает резкий край маски до передачи в SDXL |
+| **Poisson blending** | Математически бесшовный переход на границе (решение уравнения Пуассона) |
+| **Синтетическая тень** | Тень под объектом в направлении, обратном источнику света |
+| **Color harmonization** | Цветовая статистика (mean/std в LAB) выравнивается с окружением |
+| **Grain matching** | Зернистость оригинала добавляется в inpainted регион |
+| **Motion blur** | Граница маски размывается пропорционально optical flow |
+| **Temporal consistency** | 15% предыдущего кадра смешивается с текущим → нет мерцания |
 
 ### Три режима выбора объекта
 
@@ -192,14 +211,23 @@ Invoke-WebRequest -Uri "https://github.com/IDEA-Research/GroundingDINO/releases/
 
 Конфиг Grounding DINO определяется автоматически из установленного пакета. Ничего дополнительно скачивать не нужно.
 
-#### SDXL + ControlNet (скачиваются автоматически с HuggingFace)
+#### SDXL + ControlNet + IP-Adapter (скачиваются автоматически с HuggingFace)
 
-Модели скачиваются при первом запуске (~15 GB суммарно). Нужен доступ к HuggingFace:
+Модели скачиваются при первом запуске (~16.5 GB суммарно). Нужен доступ к HuggingFace:
 
 ```bash
 pip install huggingface_hub
 huggingface-cli login   # опционально, для приватных моделей
 ```
+
+| Модель | Размер | Назначение |
+|--------|--------|-----------|
+| `diffusers/stable-diffusion-xl-1.0-inpainting-0.1` | ~6 GB | SDXL Inpainting |
+| `diffusers/controlnet-canny-sdxl-1.0` | ~2.5 GB | ControlNet Canny |
+| `diffusers/controlnet-depth-sdxl-1.0` | ~2.5 GB | ControlNet Depth (только с `--multi-controlnet`) |
+| `h94/IP-Adapter` (sdxl_models) | ~1.5 GB | IP-Adapter (стилевой референс) |
+
+> IP-Adapter скачивается автоматически при первом запуске. Отключить: `--no-ip-adapter`
 
 #### RAFT (опционально, для более точного temporal blending)
 
@@ -316,17 +344,34 @@ python src/main.py \
 
 ```bash
 python src/main.py \
+  --input           videos/input.mp4 \
+  --output          videos/output.mp4 \
+  --mode            auto \
+  --detect-prompt   "ceramic mug" \
+  --prompt          "ceramic mug with dragon, hyperrealistic, 8k, studio lighting" \
+  --multi-controlnet \
+  --use-raft        \
+  --raft-model      RAFT/models/raft-things.pth \
+  --steps           40 \
+  --guidance-scale  8.0 \
+  --blend-alpha     0.8 \
+  --ip-adapter-scale 0.65 \
+  --shadow-opacity  0.4 \
+  --feather-radius  16
+```
+
+### Быстрый тест без тяжёлых модулей
+
+```bash
+python src/main.py \
   --input          videos/input.mp4 \
   --output         videos/output.mp4 \
-  --mode           auto \
-  --detect-prompt  "ceramic mug" \
-  --prompt         "ceramic mug with dragon, hyperrealistic, 8k, studio lighting" \
-  --multi-controlnet \
-  --use-raft       \
-  --raft-model     RAFT/models/raft-things.pth \
-  --steps          40 \
-  --guidance-scale 8.0 \
-  --blend-alpha    0.8
+  --mode           text \
+  --detect-prompt  "mug" \
+  --prompt         "mug with galaxy print, photorealistic" \
+  --steps          10 \
+  --no-ip-adapter \
+  --shadow-opacity 0
 ```
 
 ### Принудительно указать устройство
@@ -346,29 +391,65 @@ python src/main.py --device cpu ...
 
 ## Все параметры
 
+### Ввод / вывод
+
 | Параметр | По умолчанию | Описание |
 |----------|-------------|----------|
 | `--input` | `input.mp4` | Входное видео |
 | `--output` | `output.mp4` | Выходное видео |
-| `--mode` | `auto` | Режим выбора: `click`, `text`, `auto` |
-| `--detect-prompt` | *(первые 3 слова --prompt)* | Что найти на видео (для Grounding DINO) |
-| `--box-threshold` | `0.35` | Порог уверенности bbox (ниже → больше детекций) |
-| `--text-threshold` | `0.25` | Порог совпадения текста (ниже → мягче поиск) |
-| `--scan-frames` | `10` | Сколько кадров сканировать если объект не на кадре 0 |
-| `--prompt` | *(встроенный)* | Что сгенерировать вместо объекта (для SDXL) |
-| `--negative-prompt` | *(встроенный)* | Что исключить из генерации |
 | `--device` | *(авто)* | `cuda` / `mps` / `cpu` |
-| `--seed` | `42` | Фиксированный seed для воспроизводимости |
-| `--steps` | `30` | Шаги диффузии на кадр (больше = лучше, медленнее) |
-| `--guidance-scale` | `7.5` | CFG scale (выше = строже следует промпту) |
+
+### Выбор объекта
+
+| Параметр | По умолчанию | Описание |
+|----------|-------------|----------|
+| `--mode` | `auto` | Режим: `click`, `text`, `auto` |
+| `--detect-prompt` | *(первые 3 слова --prompt)* | Что найти (для Grounding DINO) |
+| `--box-threshold` | `0.35` | Порог уверенности bbox (ниже → больше детекций) |
+| `--text-threshold` | `0.25` | Порог совпадения текста |
+| `--scan-frames` | `30` | Кол-во равномерных зондов по всему видео; все сканируются, побеждает наибольший confidence |
+| `--fill-gaps` | `2` | Заполнять пробелы маски длиной до N кадров (SAM2 drop-out) |
+
+### Генерация (SDXL)
+
+| Параметр | По умолчанию | Описание |
+|----------|-------------|----------|
+| `--prompt` | *(встроенный)* | Что сгенерировать вместо объекта |
+| `--negative-prompt` | *(встроенный)* | Что исключить из генерации |
+| `--seed` | `42` | Фиксированный seed |
+| `--steps` | `30` | Шаги диффузии (больше = лучше, медленнее) |
+| `--guidance-scale` | `7.5` | CFG scale |
+| `--feather-radius` | `12` | Размытие краёв маски перед inpainting (0 = жёсткий край) |
+
+### Реализм и постобработка
+
+| Параметр | По умолчанию | Описание |
+|----------|-------------|----------|
+| `--no-ip-adapter` | выкл | Отключить IP-Adapter (по умолчанию **включён**) |
+| `--ip-adapter-scale` | `0.55` | Сила влияния IP-Adapter референса (0–1) |
+| `--no-light-analysis` | выкл | Отключить авто-анализ освещения сцены |
+| `--shadow-opacity` | `0.35` | Непрозрачность тени (0 = без тени) |
+| `--shadow-offset` | `10` | Смещение тени в пикселях |
+| `--light-angle` | *(авто)* | Направление света в градусах (0=право, 90=верх, 180=лево) |
+| `--no-poisson` | выкл | Отключить Poisson seamless blending |
 | `--blend-alpha` | `0.85` | Темпоральный блендинг (1.0 = без сглаживания) |
-| `--multi-controlnet` | выкл | Canny + Depth ControlNet (выше качество, медленнее) |
-| `--use-raft` | выкл | RAFT вместо Farneback (точнее, нужен RAFT repo) |
+
+### ControlNet / Optical flow
+
+| Параметр | По умолчанию | Описание |
+|----------|-------------|----------|
+| `--multi-controlnet` | выкл | Canny + Depth ControlNet (лучше качество, медленнее) |
+| `--use-raft` | выкл | RAFT optical flow (точнее Farneback, нужен RAFT repo) |
 | `--raft-model` | `RAFT/models/raft-things.pth` | Путь к весам RAFT |
-| `--sam2-checkpoint` | `sam2_hiera_large.pt` | Путь к весам SAM2 |
-| `--sam2-config` | `configs/sam2.1/sam2.1_hiera_l.yaml` | Путь к конфигу SAM2 |
-| `--gdino-config` | *(внутри пакета)* | Путь к конфигу Grounding DINO (авто) |
-| `--gdino-checkpoint` | `groundingdino_swint_ogc.pth` | Путь к весам Grounding DINO |
+
+### Пути к моделям
+
+| Параметр | По умолчанию | Описание |
+|----------|-------------|----------|
+| `--sam2-checkpoint` | `sam2_hiera_large.pt` | Веса SAM2 |
+| `--sam2-config` | `configs/sam2.1/sam2.1_hiera_l.yaml` | Конфиг SAM2 |
+| `--gdino-config` | *(авто)* | Конфиг Grounding DINO (авто-определяется) |
+| `--gdino-checkpoint` | `groundingdino_swint_ogc.pth` | Веса Grounding DINO |
 
 ---
 
@@ -458,6 +539,28 @@ cd /path/to/video_changer
 python src/main.py ...
 ```
 
+### IP-Adapter не загружается / ошибка при скачивании
+
+IP-Adapter требует интернета при первом запуске (~1.5 GB). Если нет доступа или ошибка:
+```bash
+python src/main.py --no-ip-adapter ...
+```
+
+### Объект на всех кадрах выглядит по-разному (мерцание стиля)
+
+IP-Adapter решает эту проблему. Убедись что он включён (по умолчанию), и попробуй увеличить его влияние:
+```bash
+--ip-adapter-scale 0.7
+```
+
+### Grounding DINO выбирает не тот объект
+
+Используй более высокий порог чтобы отфильтровать слабые детекции:
+```bash
+--box-threshold 0.45
+```
+Или переключись на ручной режим: `--mode click`
+
 ### На Windows: ошибка при сборке видео через imageio
 
 ```bash
@@ -473,11 +576,14 @@ ffmpeg -version
 | Библиотека | Версия | Назначение |
 |-----------|--------|-----------|
 | PyTorch | 2.x | Основной DL фреймворк |
-| diffusers | 0.30+ | SDXL Inpainting pipeline |
+| diffusers | **0.33+** | SDXL Inpainting + IP-Adapter SDXL |
 | SAM2 | latest (git) | Сегментация и трекинг объектов |
 | Grounding DINO | 0.4+ | Детекция по текстовому промпту |
 | transformers | 4.40–4.47 | Текстовые энкодеры (BERT для DINO, CLIP для SDXL) |
 | controlnet_aux | 0.0.10 | Depth/Canny карты для ControlNet |
-| opencv-python | 4.x | Обработка видео и интерактивный UI |
+| opencv-python | 4.x | Обработка видео, Poisson blending, UI |
 | imageio + imageio-ffmpeg | 2.x | Сборка видео |
+| huggingface_hub | 0.23+ | Авто-загрузка IP-Adapter весов |
 | RAFT | — | Точный optical flow (опционально) |
+
+> **Примечание**: IP-Adapter веса (`h94/IP-Adapter`, ~1.5 GB) и модели SDXL/ControlNet (~15 GB) скачиваются автоматически с HuggingFace при первом запуске.

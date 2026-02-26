@@ -14,7 +14,8 @@
 # ──────────────────────────────────────────────────────────────
 
 # Diffusion models
-diffusers>=0.30.0
+# ≥0.33.0 required for IP-Adapter SDXL support (pipe.load_ip_adapter)
+diffusers>=0.33.0
 # groundingdino-py is incompatible with transformers>=4.48 (BertModel.get_head_mask issue)
 transformers>=4.40.0,<4.48.0
 accelerate>=0.30.0

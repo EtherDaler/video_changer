@@ -73,15 +73,15 @@ def detect_bbox(
     model,
     image_np: np.ndarray,
     text_prompt: str,
-    box_threshold: float = 0.35,
-    text_threshold: float = 0.25,
+    box_threshold: float = 0.82,
+    text_threshold: float = 0.77,
     device: str = "cpu",
-) -> tuple[tuple[int, int, int, int], str] | None:
+) -> tuple[tuple[int, int, int, int], str, float] | None:
     """
     Detect the best-matching bounding box for *text_prompt* in *image_np*.
 
-    Returns (x1, y1, x2, y2) in pixel coords and the matched phrase,
-    or None if nothing was found above the thresholds.
+    Returns (bbox, matched_phrase, confidence) where bbox is (x1, y1, x2, y2)
+    in pixel coords, or None if nothing was found above the thresholds.
     """
     from groundingdino.util.inference import predict
 
@@ -108,7 +108,7 @@ def detect_bbox(
     x2 = min(w, int((cx + bw / 2) * w))
     y2 = min(h, int((cy + bh / 2) * h))
 
-    return (x1, y1, x2, y2), phrases[best]
+    return (x1, y1, x2, y2), phrases[best], float(logits[best])
 
 
 # ──────────────────────────────────────────────
@@ -143,23 +143,23 @@ def text_to_mask(
     sam_predictor,
     image_np: np.ndarray,
     text_prompt: str,
-    box_threshold: float = 0.35,
-    text_threshold: float = 0.25,
+    box_threshold: float = 0.82,
+    text_threshold: float = 0.77,
     device: str = "cpu",
-) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None, str | None]:
+) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None, str | None, float]:
     """
     End-to-end: text prompt → segmentation mask.
 
-    Returns (mask, bbox, matched_phrase).
-    All three are None if the object was not detected.
+    Returns (mask, bbox, matched_phrase, confidence).
+    mask/bbox/phrase are None and confidence is 0.0 if the object was not detected.
     """
     result = detect_bbox(
         grounding_model, image_np, text_prompt,
         box_threshold, text_threshold, device=device,
     )
     if result is None:
-        return None, None, None
+        return None, None, None, 0.0
 
-    bbox, phrase = result
+    bbox, phrase, conf = result
     mask = get_mask_from_bbox(sam_predictor, image_np, bbox)
-    return mask, bbox, phrase
+    return mask, bbox, phrase, conf

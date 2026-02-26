@@ -73,7 +73,51 @@ def track_masks_video(
 
     # Fill frames where SAM2 found nothing with an empty mask.
     empty = np.zeros(initial_mask.shape, dtype=np.uint8)
-    return [m if m is not None else empty.copy() for m in tracked]
+    result = [m if m is not None else empty.copy() for m in tracked]
+    return result
+
+
+def fill_mask_gaps(masks: list[np.ndarray], max_gap: int = 2) -> list[np.ndarray]:
+    """
+    Fill isolated runs of empty masks that are surrounded by non-empty ones.
+
+    This fixes SAM2 Video Predictor drop-outs where the model loses confidence
+    for 1-2 frames even though the object is clearly still present.
+
+    Args:
+        masks:    List of uint8 masks (0/255), one per frame.
+        max_gap:  Maximum length of an empty run to fill.
+                  Runs longer than this are kept empty (object genuinely absent).
+    """
+    n = len(masks)
+    filled = [m.copy() for m in masks]
+
+    i = 0
+    while i < n:
+        if filled[i].any():
+            i += 1
+            continue
+
+        # Find the extent of this empty run.
+        j = i
+        while j < n and not filled[j].any():
+            j += 1
+        gap_len = j - i
+
+        # Fill only if the gap is short enough and has non-empty neighbours on both sides.
+        has_left  = i > 0 and filled[i - 1].any()
+        has_right = j < n and filled[j].any()
+        if gap_len <= max_gap and has_left and has_right:
+            for k in range(i, j):
+                # Interpolate linearly between the bordering masks.
+                left_mask  = filled[i - 1].astype(np.float32)
+                right_mask = filled[j].astype(np.float32)
+                t = (k - i + 1) / (gap_len + 1)
+                blended = (1 - t) * left_mask + t * right_mask
+                filled[k] = (blended > 127).astype(np.uint8) * 255
+
+        i = j if gap_len > max_gap else j  # skip past the run
+    return filled
 
 
 # ──────────────────────────────────────────────

@@ -146,8 +146,179 @@ def warp_image(image: np.ndarray, flow: np.ndarray) -> np.ndarray:
 
 
 # ──────────────────────────────────────────────
-# INPAINTING
+# MASK FEATHERING
 # ──────────────────────────────────────────────
+
+def feather_mask(mask_np: np.ndarray, radius: int = 12) -> np.ndarray:
+    """
+    Soften hard mask edges with a Gaussian blur so SDXL inpainting blends
+    into the surroundings rather than cutting out sharply.
+
+    Returns a uint8 mask (0-255) with smooth falloff near boundaries.
+    """
+    if radius < 1:
+        return mask_np
+    ksize = radius * 2 + 1
+    blurred = cv2.GaussianBlur(mask_np.astype(np.float32), (ksize, ksize), radius / 2)
+    return blurred.clip(0, 255).astype(np.uint8)
+
+
+# ──────────────────────────────────────────────
+# SCENE LIGHT ANALYSIS
+# ──────────────────────────────────────────────
+
+def analyze_scene_lighting(image_np: np.ndarray, mask_np: np.ndarray) -> str:
+    """
+    Analyse the pixels surrounding the mask and return comma-separated
+    lighting descriptor terms ready to append to the SDXL prompt.
+
+    Three axes are measured independently:
+      • Luminance  → bright / dark / medium scene
+      • Warmth     → warm golden / cool blue / neutral lighting
+      • Contrast   → high contrast / soft diffused / dramatic shadows
+    """
+    mask_bool = mask_np > 128
+    surround = ~mask_bool
+
+    if surround.sum() < 200:
+        return ""
+
+    lab = cv2.cvtColor(image_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+    L = lab[..., 0][surround]
+    mean_L = float(L.mean())
+    std_L = float(L.std())
+
+    rgb = image_np[surround].astype(np.float32)
+    warmth = float(rgb[:, 0].mean() - rgb[:, 2].mean())  # R − B channel delta
+
+    terms: list[str] = []
+
+    # Luminance
+    if mean_L > 175:
+        terms.append("bright well-lit scene")
+    elif mean_L < 70:
+        terms.append("dark scene, low-key lighting")
+    else:
+        terms.append("medium natural exposure")
+
+    # Color temperature
+    if warmth > 25:
+        terms.append("warm golden-hour lighting")
+    elif warmth < -25:
+        terms.append("cool blue-tinted atmosphere")
+    else:
+        terms.append("neutral white-balanced light")
+
+    # Contrast
+    if std_L > 55:
+        terms.append("high contrast, dramatic hard shadows")
+    elif std_L < 20:
+        terms.append("soft diffused light, gentle shadows")
+    else:
+        terms.append("moderate contrast")
+
+    return ", ".join(terms)
+
+
+def estimate_light_angle(image_np: np.ndarray, mask_np: np.ndarray) -> float:
+    """
+    Estimate the dominant light direction in the scene by looking at the
+    brightness gradient around the object.
+
+    Returns an angle in degrees (0 = right, 90 = top, 180 = left, 270 = bottom).
+    Defaults to 315 (top-left) if estimation fails.
+    """
+    mask_bool = mask_np > 128
+    surround = ~mask_bool
+    if surround.sum() < 400:
+        return 315.0
+
+    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=5)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=5)
+
+    # Average gradient direction in the surrounding region
+    mean_gx = float(gx[surround].mean())
+    mean_gy = float(gy[surround].mean())
+
+    angle_rad = float(np.arctan2(-mean_gy, mean_gx))
+    return float(np.degrees(angle_rad)) % 360.0
+
+
+# ──────────────────────────────────────────────
+# SHADOW SYNTHESIS
+# ──────────────────────────────────────────────
+
+def synthesize_shadow(
+    image_np: np.ndarray,
+    mask_np: np.ndarray,
+    light_angle_deg: float = 315.0,
+    opacity: float = 0.35,
+    offset_px: int = 10,
+    blur_radius: int = 18,
+) -> np.ndarray:
+    """
+    Add a soft synthetic drop-shadow beneath the masked object.
+
+    The shadow is cast in the direction *opposite* to the light source,
+    blurred so it feathers naturally into the scene.
+
+    Args:
+        light_angle_deg: direction FROM which light arrives
+                         (0 = right, 90 = top, 180 = left, 270 = bottom).
+        opacity:         max darkness of the shadow (0–1).
+        offset_px:       how far to displace the shadow.
+        blur_radius:     Gaussian blur radius for soft edges.
+    """
+    mask_bool = (mask_np > 128).astype(np.uint8) * 255
+    if not mask_bool.any():
+        return image_np
+
+    # Shadow falls opposite the light
+    shadow_angle = np.radians(light_angle_deg + 180.0)
+    dx = int(np.cos(shadow_angle) * offset_px)
+    dy = int(-np.sin(shadow_angle) * offset_px)   # image y-axis is flipped
+
+    h, w = mask_bool.shape
+    M: np.ndarray = np.array([[1.0, 0.0, float(dx)], [0.0, 1.0, float(dy)]], dtype=np.float32)
+    shadow_mask: np.ndarray = cv2.warpAffine(mask_bool, M, (w, h))
+
+    # Soften edges
+    ksize = blur_radius * 2 + 1
+    shadow_soft = cv2.GaussianBlur(
+        shadow_mask.astype(np.float32), (ksize, ksize), blur_radius / 2
+    )
+
+    # Don't darken where the object itself sits (shadow hidden under object)
+    shadow_soft[mask_np > 128] = 0.0
+    shadow_alpha = (shadow_soft / 255.0 * opacity)[..., np.newaxis]
+
+    result = image_np.astype(np.float32) * (1.0 - shadow_alpha)
+    return result.clip(0, 255).astype(np.uint8)
+
+
+# ──────────────────────────────────────────────
+# INPAINTING  (with optional IP-Adapter)
+# ──────────────────────────────────────────────
+
+def load_ip_adapter(pipe, scale: float = 0.6) -> bool:
+    """
+    Load IP-Adapter SDXL weights into *pipe* for appearance-guided generation.
+    Returns True on success, False if unavailable (network / weight issue).
+    """
+    try:
+        pipe.load_ip_adapter(
+            "h94/IP-Adapter",
+            subfolder="sdxl_models",
+            weight_name="ip-adapter_sdxl.bin",
+        )
+        pipe.set_ip_adapter_scale(scale)
+        print(f"  IP-Adapter loaded  (scale={scale})")
+        return True
+    except Exception as e:
+        print(f"  IP-Adapter unavailable ({e}). Skipping.")
+        return False
+
 
 def inpaint_frame(
     pipe,
@@ -157,23 +328,41 @@ def inpaint_frame(
     prompt: str,
     negative_prompt: str,
     seed: int = 42,
+    steps: int = 30,
+    guidance_scale: float = 7.5,
+    feather_radius: int = 12,
+    ip_adapter_image: Image.Image | None = None,
+    extra_prompt_terms: str = "",
 ) -> np.ndarray:
     """Inpaint one frame; returns RGB numpy array."""
+    # Auto-append scene lighting analysis to guide SDXL style matching
+    full_prompt = prompt
+    if extra_prompt_terms:
+        full_prompt = f"{prompt}, {extra_prompt_terms}"
+
+    # Feather mask edges so SDXL blends smoothly at boundaries
+    soft_mask = feather_mask(mask_np, radius=feather_radius)
+
     image_pil = Image.fromarray(image_np)
-    mask_pil = Image.fromarray(mask_np)
+    mask_pil  = Image.fromarray(soft_mask)
     generator = torch.Generator(DEVICE).manual_seed(seed)
+
+    extra_kwargs: dict = {}
+    if ip_adapter_image is not None:
+        extra_kwargs["ip_adapter_image"] = ip_adapter_image
 
     with torch.no_grad():
         result = pipe(
-            prompt=prompt,
+            prompt=full_prompt,
             negative_prompt=negative_prompt,
             image=image_pil,
             mask_image=mask_pil,
             control_image=control_image,
-            guidance_scale=7.5,
-            num_inference_steps=30,
+            guidance_scale=guidance_scale,
+            num_inference_steps=steps,
             generator=generator,
             output_type="pil",
+            **extra_kwargs,
         )
 
     return np.array(result.images[0])
@@ -206,6 +395,47 @@ def apply_temporal_consistency(
     )
     result = current_np.astype(np.float32) * (1.0 - mask_f) + blended * mask_f
     return result.clip(0, 255).astype(np.uint8)
+
+
+# ──────────────────────────────────────────────
+# POISSON SEAMLESS BLENDING
+# ──────────────────────────────────────────────
+
+def poisson_blend(
+    original_np: np.ndarray,
+    inpainted_np: np.ndarray,
+    mask_np: np.ndarray,
+) -> np.ndarray:
+    """
+    Blend the inpainted region into the original frame using Poisson seamless
+    cloning (cv2.seamlessClone). This is the same technique used in professional
+    compositing: it equalises gradients at the boundary so the seam becomes
+    mathematically invisible.
+
+    Works best when the inpainted object has similar luminance to the scene.
+    Falls back to the inpainted result if the mask is too small.
+    """
+    mask_bool = mask_np > 128
+    if mask_bool.sum() < 100:
+        return inpainted_np
+
+    # cv2.seamlessClone expects BGR images and a binary uint8 mask
+    src_bgr  = cv2.cvtColor(inpainted_np, cv2.COLOR_RGB2BGR)
+    dst_bgr  = cv2.cvtColor(original_np,  cv2.COLOR_RGB2BGR)
+    mask_u8  = (mask_bool.astype(np.uint8)) * 255
+
+    # Centre of the mask bounding box — required by seamlessClone
+    ys, xs = np.where(mask_bool)
+    cx = int((xs.min() + xs.max()) / 2)
+    cy = int((ys.min() + ys.max()) / 2)
+
+    try:
+        blended_bgr = cv2.seamlessClone(src_bgr, dst_bgr, mask_u8, (cx, cy),
+                                        cv2.NORMAL_CLONE)
+        return cv2.cvtColor(blended_bgr, cv2.COLOR_BGR2RGB)
+    except cv2.error:
+        # seamlessClone can fail when the mask touches the image border
+        return inpainted_np
 
 
 # ──────────────────────────────────────────────
@@ -335,12 +565,52 @@ def _select_mask(
     """
     from ui import select_click_point, confirm_mask, show_bbox_preview
     from sam_load import get_mask_from_click
-    from detector import load_grounding_dino, detect_bbox, get_mask_from_bbox, text_to_mask
+    from detector import load_grounding_dino, detect_bbox, get_mask_from_bbox
 
     first_frame = frames[0]
 
     # Derive detect_prompt from the generation prompt if not given
     detect_prompt = args.detect_prompt or " ".join(args.prompt.split()[:3])
+
+    def _scan_indices(n_frames: int, n_probes: int) -> list[int]:
+        """Return up to n_probes evenly-spaced frame indices across [0, n_frames)."""
+        if n_probes >= n_frames:
+            return list(range(n_frames))
+        step = n_frames / n_probes
+        return [int(i * step) for i in range(n_probes)]
+
+    def _best_detection(
+        gdino, indices: list[int], prompt: str
+    ) -> tuple[int, np.ndarray, tuple, str, float] | None:
+        """
+        Scan all frames in *indices*, collect every detection above threshold,
+        return (frame_idx, frame, bbox, phrase, confidence) for the globally
+        highest-confidence hit — or None if nothing found.
+
+        Scanning ALL sampled frames (not stopping at first) ensures we don't
+        accidentally pick a false positive that appears earlier but with lower
+        confidence than the real target later in the video.
+        """
+        best: tuple[float, int, np.ndarray, tuple, str] | None = None
+        n = len(frames)
+        for fi in indices:
+            result = detect_bbox(
+                gdino, frames[fi], prompt,
+                box_threshold=args.box_threshold,
+                text_threshold=args.text_threshold,
+                device=DEVICE,
+            )
+            if result is None:
+                continue
+            bbox, phrase, conf = result
+            print(f"    frame {fi:4d}/{n}: '{phrase}'  conf={conf:.3f}")
+            if best is None or conf > best[0]:
+                best = (conf, fi, frames[fi], bbox, phrase)
+
+        if best is None:
+            return None
+        conf, fi, frame, bbox, phrase = best
+        return fi, frame, bbox, phrase, conf
 
     # ── click ──────────────────────────────────────────────────────────────
     if args.mode == "click":
@@ -362,60 +632,54 @@ def _select_mask(
 
     # ── text ───────────────────────────────────────────────────────────────
     if args.mode == "text":
-        print(f"Text mode: detecting \"{detect_prompt}\" (scanning up to {args.scan_frames} frames)…")
+        indices = _scan_indices(len(frames), args.scan_frames)
+        print(f"Text mode: detecting \"{detect_prompt}\" "
+              f"(scanning {len(indices)} evenly-spaced frames, picking best confidence)…")
         gdino = load_grounding_dino(args.gdino_config, args.gdino_checkpoint, device=DEVICE)
         sam = _build_sam(args)
 
-        mask, bbox, phrase, seed_idx = None, None, None, 0
-        scan_limit = min(args.scan_frames, len(frames))
-        for fi in range(scan_limit):
-            mask, bbox, phrase = text_to_mask(
-                gdino, sam, frames[fi], detect_prompt,
-                box_threshold=args.box_threshold,
-                text_threshold=args.text_threshold,
-                device=DEVICE,
-            )
-            if mask is not None:
-                seed_idx = fi
-                break
+        hit = _best_detection(gdino, indices, detect_prompt)
 
-        del gdino, sam
-        torch.cuda.empty_cache()
-
-        if mask is None:
+        if hit is None:
+            del gdino, sam
+            torch.cuda.empty_cache()
             raise RuntimeError(
                 f"Grounding DINO could not find \"{detect_prompt}\" "
-                f"in the first {scan_limit} frames.\n"
+                f"in {len(indices)} sampled frames.\n"
                 f"Tips:\n"
                 f"  • Try a simpler word: \"mug\", \"cup\", \"watch\", \"bottle\"\n"
                 f"  • Lower thresholds: --box-threshold 0.2 --text-threshold 0.15\n"
-                f"  • Scan more frames: --scan-frames 30\n"
+                f"  • Probe more frames: --scan-frames 60\n"
                 f"  • Switch mode: --mode click"
             )
-        print(f"  Detected: \"{phrase}\" on frame {seed_idx} at {bbox}")
+
+        seed_idx, seed_frame, bbox, phrase, conf = hit
+        print(f"  ★ Best: \"{phrase}\" on frame {seed_idx}  confidence={conf:.3f}")
+        if conf < 0.40:
+            print(f"  ⚠ Low confidence ({conf:.3f}). If the wrong object was selected,")
+            print(f"    try --box-threshold 0.40 or --mode click.")
+
+        mask = get_mask_from_bbox(sam, seed_frame, bbox)
+        del gdino, sam
+        torch.cuda.empty_cache()
         return mask, seed_idx
 
     # ── auto ───────────────────────────────────────────────────────────────
-    # auto = text detection first (scans first N frames), then user confirms / refines
-    print(f"Auto mode: detecting \"{detect_prompt}\" (scanning up to {args.scan_frames} frames)…")
+    # auto = text detection (best confidence across all sampled frames), then user confirms
+    indices = _scan_indices(len(frames), args.scan_frames)
+    print(f"Auto mode: detecting \"{detect_prompt}\" "
+          f"(scanning {len(indices)} evenly-spaced frames, picking best confidence)…")
     gdino = load_grounding_dino(args.gdino_config, args.gdino_checkpoint, device=DEVICE)
     sam = _build_sam(args)
 
-    # Find first frame where the object is detected
-    scan_limit = min(args.scan_frames, len(frames))
-    seed_idx = 0
-    seed_frame = first_frame
-    for fi in range(scan_limit):
-        probe = detect_bbox(
-            gdino, frames[fi], detect_prompt,
-            box_threshold=args.box_threshold,
-            text_threshold=args.text_threshold,
-            device=DEVICE,
-        )
-        if probe is not None:
-            seed_idx = fi
-            seed_frame = frames[fi]
-            break
+    # Find the globally best-confidence detection across all sampled frames
+    hit = _best_detection(gdino, indices, detect_prompt)
+    if hit is not None:
+        seed_idx, seed_frame, _, _, conf = hit
+        print(f"  ★ Best detection on frame {seed_idx}  confidence={conf:.3f}")
+    else:
+        seed_idx = 0
+        seed_frame = first_frame
 
     mask = None
     while mask is None:
@@ -434,7 +698,7 @@ def _select_mask(
             detect_prompt = new_prompt
             continue
 
-        bbox, phrase = result
+        bbox, phrase, conf = result
 
         # Show bounding box for quick sanity check
         decision = show_bbox_preview(seed_frame, bbox, phrase)
@@ -528,12 +792,14 @@ def parse_args() -> argparse.Namespace:
             "Defaults to the first two words of --prompt if not set."
         ),
     )
-    p.add_argument("--box-threshold",  type=float, default=0.35,
+    p.add_argument("--box-threshold",  type=float, default=0.82,
                    help="Grounding DINO box confidence threshold (lower = more detections)")
-    p.add_argument("--text-threshold", type=float, default=0.25,
+    p.add_argument("--text-threshold", type=float, default=0.77,
                    help="Grounding DINO text similarity threshold (lower = more detections)")
-    p.add_argument("--scan-frames",    type=int,   default=10,
-                   help="In text/auto mode: scan first N frames if object not on frame 0")
+    p.add_argument("--scan-frames",    type=int,   default=30,
+                   help="How many evenly-spaced frames to probe across the whole video. All are scanned and the highest-confidence detection wins.")
+    p.add_argument("--fill-gaps",      type=int,   default=2,
+                   help="Fill isolated empty-mask runs of this length or shorter (fixes SAM2 single-frame drop-outs)")
 
     # Diffusion
     p.add_argument("--prompt",          default=DEFAULT_PROMPT)
@@ -543,6 +809,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--guidance-scale",  type=float, default=7.5)
     p.add_argument("--blend-alpha",     type=float, default=0.85,
                    help="Temporal blend alpha (1.0 = no blending)")
+    p.add_argument("--feather-radius",  type=int,   default=12,
+                   help="Gaussian feather radius for mask edges before inpainting (0 = hard mask)")
+    p.add_argument("--no-poisson",      action="store_true",
+                   help="Disable Poisson seamless blending (faster but seams more visible)")
+
+    # Realism: IP-Adapter, light analysis, shadow
+    p.add_argument("--no-ip-adapter",   action="store_true",
+                   help="Disable IP-Adapter reference (enabled by default; first inpainted frame guides all others)")
+    p.add_argument("--ip-adapter-scale", type=float, default=0.55,
+                   help="IP-Adapter influence strength (0.0–1.0, default 0.55)")
+    p.add_argument("--no-light-analysis", action="store_true",
+                   help="Disable automatic scene lighting analysis appended to prompt")
+    p.add_argument("--shadow-opacity",  type=float, default=0.35,
+                   help="Drop shadow opacity (0.0 = no shadow, 1.0 = fully opaque)")
+    p.add_argument("--shadow-offset",   type=int,   default=10,
+                   help="Shadow displacement in pixels")
+    p.add_argument("--light-angle",     type=float, default=None,
+                   help="Override estimated light direction in degrees (0=right, 90=top, 180=left)")
 
     # ControlNet / flow
     p.add_argument("--multi-controlnet", action="store_true",
@@ -590,12 +874,21 @@ def main() -> None:
     tracked_masks = track_masks_video(video_predictor, frames, initial_mask, initial_frame_idx=seed_frame_idx)
     del video_predictor
     torch.cuda.empty_cache()
+
+    # Fill short drop-out gaps (SAM2 occasionally loses confidence for 1-2 frames).
+    from sam_video import fill_mask_gaps
+    tracked_masks = fill_mask_gaps(tracked_masks, max_gap=args.fill_gaps)
     print(f"  Tracking done. "
           f"Object present in {sum(m.any() for m in tracked_masks)}/{len(frames)} frames.")
 
     # ── 4. Diffusion pipeline (loaded after SAM2 is freed) ────────────────
     print("Loading diffusion pipeline…")
     pipe, depth_detector = load_pipeline(args.multi_controlnet)
+
+    # IP-Adapter: load weights so first inpainted frame can guide all others
+    ip_adapter_ok = False
+    if not args.no_ip_adapter:
+        ip_adapter_ok = load_ip_adapter(pipe, scale=args.ip_adapter_scale)
 
     # ── 5. RAFT (optional, for temporal blending only) ────────────────────
     raft_model = None
@@ -609,21 +902,21 @@ def main() -> None:
 
     # ── 6. Frame loop ─────────────────────────────────────────────────────
     prev_result: np.ndarray | None = None
+    ip_reference: Image.Image | None = None   # set after first successful inpaint
     processed: list[np.ndarray] = []
 
     for i, frame in enumerate(frames):
         print(f"  Frame {i + 1}/{len(frames)}", end="\r", flush=True)
 
-        # Use SAM2-tracked mask (replaces optical flow mask warping)
         mask = tracked_masks[i]
 
         # Skip frames where object is not visible — no diffusion needed
         if not mask.any():
             processed.append(frame.copy())
-            prev_result = None  # reset temporal state on gap
+            prev_result = None
             continue
 
-        # Optical flow — only for temporal blending on frames with the object
+        # Optical flow — only for temporal blending
         if i > 0:
             if raft_model is not None:
                 from raft_load import compute_flow_raft
@@ -641,11 +934,49 @@ def main() -> None:
         else:
             control_image = canny
 
-        # SDXL inpainting
+        # ── Scene light analysis → auto-enrich prompt ────────────────────
+        scene_lighting = ""
+        if not args.no_light_analysis:
+            scene_lighting = analyze_scene_lighting(frame, mask)
+
+        # ── SDXL inpainting ──────────────────────────────────────────────
+        # First frame: no IP-Adapter reference yet → generate freely.
+        # All subsequent frames: pass the first inpainted result as the
+        # IP-Adapter reference so appearance stays consistent across frames.
         inpainted = inpaint_frame(
             pipe, frame, mask, control_image,
-            args.prompt, args.negative_prompt, seed=args.seed,
+            args.prompt, args.negative_prompt,
+            seed=args.seed,
+            steps=args.steps,
+            guidance_scale=args.guidance_scale,
+            feather_radius=args.feather_radius,
+            ip_adapter_image=ip_reference if ip_adapter_ok else None,
+            extra_prompt_terms=scene_lighting,
         )
+
+        # Store the very first inpainted result as the IP-Adapter reference
+        if ip_adapter_ok and ip_reference is None:
+            ip_reference = Image.fromarray(inpainted)
+
+        # ── Post-processing ──────────────────────────────────────────────
+
+        # Shadow synthesis (applied to original frame, before compositing)
+        if args.shadow_opacity > 0:
+            light_angle = args.light_angle
+            if light_angle is None:
+                light_angle = estimate_light_angle(frame, mask)
+            frame_with_shadow = synthesize_shadow(
+                frame, mask,
+                light_angle_deg=light_angle,
+                opacity=args.shadow_opacity,
+                offset_px=args.shadow_offset,
+            )
+        else:
+            frame_with_shadow = frame
+
+        # Poisson seamless blending
+        if not args.no_poisson:
+            inpainted = poisson_blend(frame_with_shadow, inpainted, mask)
 
         # Temporal consistency
         inpainted = apply_temporal_consistency(
