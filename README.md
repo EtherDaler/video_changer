@@ -340,7 +340,8 @@ python src/main.py \
   --mode   text \
   --detect-prompt "mug" \
   --prompt "ceramic mug with space galaxy design, photorealistic" \
-  --steps  10
+  --steps  10 \
+  --width  768 --height 768
 ```
 
 ### Режим auto (рекомендуется)
@@ -413,6 +414,22 @@ python src/main.py \
   --shadow-opacity 0
 ```
 
+### RTX 5060 / 5070 / 5080 / 5090 (после установки CUDA 12.8)
+
+```bash
+python src/main.py \
+  --input  videos/input.mp4 \
+  --output videos/output.mp4 \
+  --mode   text \
+  --detect-prompt "mug" \
+  --prompt "ceramic mug with space galaxy design, photorealistic" \
+  --steps  20 \
+  --width  768 --height 768 \
+  --cpu-offload
+```
+
+> После установки PyTorch с CUDA 12.8 (`--index-url https://download.pytorch.org/whl/cu128`) флаги `--attention-slicing` и `--torch-compile` не нужны — Flash Attention работает нативно.
+
 ### Принудительно указать устройство
 
 ```bash
@@ -444,8 +461,8 @@ python src/main.py --device cpu ...
 |----------|-------------|----------|
 | `--mode` | `auto` | Режим: `click`, `text`, `auto` |
 | `--detect-prompt` | *(первые 3 слова --prompt)* | Что найти (для Grounding DINO) |
-| `--box-threshold` | `0.35` | Порог уверенности bbox (ниже → больше детекций) |
-| `--text-threshold` | `0.25` | Порог совпадения текста |
+| `--box-threshold` | `0.82` | Порог уверенности bbox (ниже → больше детекций) |
+| `--text-threshold` | `0.77` | Порог совпадения текста |
 | `--scan-frames` | `30` | Кол-во равномерных зондов по всему видео; все сканируются, побеждает наибольший confidence |
 | `--fill-gaps` | `2` | Заполнять пробелы маски длиной до N кадров (SAM2 drop-out) |
 
@@ -473,12 +490,21 @@ python src/main.py --device cpu ...
 | `--no-poisson` | выкл | Отключить Poisson seamless blending |
 | `--blend-alpha` | `0.85` | Темпоральный блендинг (1.0 = без сглаживания) |
 
-### Управление памятью GPU
+### Разрешение обработки
+
+| Параметр | По умолчанию | Описание |
+|----------|-------------|----------|
+| `--width` | `1024` | Ширина обработки в пикселях. `768` даёт ~3× ускорение |
+| `--height` | `1024` | Высота обработки в пикселях. SDXL работает лучше всего при 768–1024 |
+
+### Управление памятью и производительностью GPU
 
 | Параметр | По умолчанию | Описание |
 |----------|-------------|----------|
 | `--cpu-offload` | выкл | Модели перемещаются в CPU RAM по необходимости (~4 GB VRAM) |
 | `--sequential-offload` | выкл | Один слой на GPU одновременно (~3 GB VRAM, медленнее) |
+| `--attention-slicing` | выкл | Чанкованное attention — помогает на архитектурах без Flash Attention |
+| `--torch-compile` | выкл | JIT-компиляция UNet под конкретный GPU. Первый кадр медленный (2-5 мин warm-up), последующие — быстрые. Необходим для Blackwell (RTX 5060+) без CUDA 12.8 |
 
 ### ControlNet / Optical flow
 
