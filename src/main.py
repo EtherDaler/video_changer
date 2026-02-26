@@ -32,8 +32,12 @@ def _auto_device() -> str:
 DEVICE = _auto_device()
 # float16 is not supported on CPU; MPS works fine with float16 on modern macOS
 DTYPE = torch.float32 if DEVICE == "cpu" else torch.float16
-WIDTH = 1024
+WIDTH  = 1024
 HEIGHT = 1024
+
+# TF32 is faster than FP32 on Ampere/Ada/Blackwell for any float32 fallback ops
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32       = True
 
 DEFAULT_PROMPT = (
     "realistic printed photo on ceramic mug surface, matching lighting"
@@ -47,12 +51,37 @@ DEFAULT_NEG_PROMPT = (
 # PIPELINE LOADING
 # ──────────────────────────────────────────────
 
+def _apply_torch_compile(pipe) -> None:
+    """
+    JIT-compile the UNet (and optionally VAE decoder) with torch.compile.
+
+    On new GPU architectures (e.g. Blackwell sm_120) where PyTorch ships without
+    pre-built Flash Attention kernels, torch.compile generates optimised Triton
+    kernels at runtime for the exact device, recovering most of the speed lost
+    by the unoptimised fallback.
+
+    First inference will be slower (compilation warm-up ~2-5 min), every
+    subsequent frame runs at full compiled speed.
+    """
+    try:
+        print("  torch.compile: compiling UNet (first frame will be slow — warm-up)…")
+        pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=False)
+        # VAE decode is also in the hot path; compile it too
+        if hasattr(pipe, "vae"):
+            pipe.vae.decode = torch.compile(pipe.vae.decode, mode="reduce-overhead", fullgraph=False)
+        print("  torch.compile ready")
+    except Exception as e:
+        print(f"  torch.compile skipped ({e})")
+
+
 def load_pipeline(
     use_multi_controlnet: bool = False,
     device: str = DEVICE,
     dtype: torch.dtype = DTYPE,
     cpu_offload: bool = False,
     sequential_offload: bool = False,
+    attention_slicing: bool = False,
+    torch_compile: bool = False,
 ):
     """
     Load SDXL inpainting pipeline with Canny (+ Depth) ControlNet.
@@ -61,14 +90,20 @@ def load_pipeline(
       default             — all weights on GPU (~8 GB VRAM needed)
       cpu_offload         — model layers swapped to CPU RAM on demand (~4 GB VRAM)
       sequential_offload  — one layer at a time on GPU (~3 GB VRAM, slower)
+
+    attention_slicing uses a chunked attention code path which can be faster
+    on GPU architectures where Flash/memory-efficient attention is not available.
     """
     if use_multi_controlnet:
         from multy_control_net import build_multi_controlnet_pipe
-        return build_multi_controlnet_pipe(
+        pipe, depth_detector = build_multi_controlnet_pipe(
             dtype, device,
             cpu_offload=cpu_offload,
             sequential_offload=sequential_offload,
         )
+        if torch_compile:
+            _apply_torch_compile(pipe)
+        return pipe, depth_detector
 
     controlnet: ControlNetModel = ControlNetModel.from_pretrained(  # type: ignore[assignment]
         "diffusers/controlnet-canny-sdxl-1.0",
@@ -87,11 +122,9 @@ def load_pipeline(
     )
 
     if sequential_offload:
-        # Minimum VRAM (~3 GB). Each sub-module moves to GPU one at a time.
         pipe.enable_sequential_cpu_offload()
         print("  Memory mode: sequential CPU offload (~3 GB VRAM)")
     elif cpu_offload:
-        # Good balance — model blocks move to GPU only when needed (~4 GB VRAM).
         pipe.enable_model_cpu_offload()
         print("  Memory mode: model CPU offload (~4 GB VRAM)")
     else:
@@ -102,6 +135,15 @@ def load_pipeline(
             print("  xformers memory-efficient attention enabled")
         except Exception:
             pass
+
+    if attention_slicing:
+        # Chunked attention: slower on well-supported GPUs, but the only
+        # efficient path on architectures where Flash Attention isn't compiled in.
+        pipe.enable_attention_slicing(1)
+        print("  Attention slicing enabled")
+
+    if torch_compile:
+        _apply_torch_compile(pipe)
 
     pipe.set_progress_bar_config(disable=True)
     return pipe, None
@@ -403,6 +445,14 @@ def inpaint_frame(
     if ip_adapter_image is not None:
         extra_kwargs["ip_adapter_image"] = ip_adapter_image
 
+    # Per-step ASCII progress bar shown inline during diffusion
+    _bar_width = 25
+    def _step_cb(pipe, step_idx: int, timestep, kwargs: dict) -> dict:
+        filled = int((step_idx + 1) / steps * _bar_width)
+        bar = "█" * filled + "░" * (_bar_width - filled)
+        print(f"\r    [{bar}] {step_idx + 1}/{steps} steps", end="", flush=True)
+        return kwargs
+
     with torch.no_grad():
         result = pipe(
             prompt=full_prompt,
@@ -414,8 +464,10 @@ def inpaint_frame(
             num_inference_steps=steps,
             generator=generator,
             output_type="pil",
+            callback_on_step_end=_step_cb,
             **extra_kwargs,
         )
+    print()  # newline after step bar
 
     return np.array(result.images[0])
 
@@ -880,11 +932,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--light-angle",     type=float, default=None,
                    help="Override estimated light direction in degrees (0=right, 90=top, 180=left)")
 
+    # Resolution (lower = faster; SDXL works best at 768–1024)
+    p.add_argument("--width",  type=int, default=1024,
+                   help="Processing width in pixels (default 1024). Use 768 for ~3x speedup on slow GPUs.")
+    p.add_argument("--height", type=int, default=1024,
+                   help="Processing height in pixels (default 1024). Use 768 for ~3x speedup on slow GPUs.")
+
     # Memory management
     p.add_argument("--cpu-offload", action="store_true",
                    help="Enable model CPU offload (~4 GB VRAM). Recommended for 8 GB GPUs.")
     p.add_argument("--sequential-offload", action="store_true",
                    help="Enable sequential CPU offload (~3 GB VRAM, slower). For 6 GB GPUs.")
+    p.add_argument("--attention-slicing", action="store_true",
+                   help="Enable attention slicing (alternative attention code path, helps on new GPU architectures).")
+    p.add_argument("--torch-compile", action="store_true",
+                   help=(
+                       "JIT-compile UNet with torch.compile (mode=reduce-overhead). "
+                       "Generates GPU-specific kernels at runtime — essential for new "
+                       "architectures like Blackwell (RTX 5060) where Flash Attention is "
+                       "not pre-compiled in PyTorch. First frame is slow (2-5 min warm-up), "
+                       "subsequent frames run at full speed."
+                   ))
 
     # ControlNet / flow
     p.add_argument("--multi-controlnet", action="store_true",
@@ -912,7 +980,25 @@ def main() -> None:
         DEVICE = args.device
         DTYPE = torch.float32 if DEVICE == "cpu" else torch.float16
 
-    print(f"Device: {DEVICE}  |  dtype: {DTYPE}")
+    # Apply resolution override (must happen before frame extraction)
+    global WIDTH, HEIGHT
+    WIDTH  = args.width
+    HEIGHT = args.height
+
+    print(f"Device: {DEVICE}  |  dtype: {DTYPE}  |  resolution: {WIDTH}×{HEIGHT}")
+
+    # Print CUDA capability so users can see if their GPU is in the supported list
+    if DEVICE == "cuda" and torch.cuda.is_available():
+        cap = torch.cuda.get_device_capability()
+        name = torch.cuda.get_device_name(0)
+        # PyTorch ships Flash Attention kernels for sm_50..sm_90; sm_120 (Blackwell) needs nightly/cu128
+        supported = cap[0] <= 9
+        attention_note = "Flash Attention supported" if supported else (
+            f"sm_{cap[0]}{cap[1]} NOT in PyTorch Flash Attention list — "
+            "attention falls back to slow O(n²) math. "
+            "Fix: pip install torch --index-url https://download.pytorch.org/whl/cu128"
+        )
+        print(f"  GPU: {name} (sm_{cap[0]}{cap[1]}) — {attention_note}")
 
     # ── 1. Frame extraction (first — frees us to plan memory) ─────────────
     print(f"Extracting frames from '{args.input}'…")
@@ -945,6 +1031,8 @@ def main() -> None:
         args.multi_controlnet,
         cpu_offload=args.cpu_offload,
         sequential_offload=args.sequential_offload,
+        attention_slicing=args.attention_slicing,
+        torch_compile=args.torch_compile,
     )
 
     # IP-Adapter: load weights so first inpainted frame can guide all others

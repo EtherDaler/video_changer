@@ -66,6 +66,33 @@ AI-инструмент для замены объектов на видео: н
 >
 > На macOS MPS SDXL обрабатывает ~3 мин/кадр. Для быстрой проверки используй `--steps 10`.
 
+### ⚠️ RTX 5060 / 5070 / 5080 / 5090 (Blackwell, sm_120) — важно
+
+RTX 5000-й серии использует архитектуру **Blackwell (sm\_120)**. В PyTorch до версии с CUDA 12.8 для неё **нет скомпилированных Flash Attention kernels**, из-за чего attention-механизм откатывается на медленный O(n²) math-mode — и один кадр может занимать 30+ минут.
+
+**Диагноз:** при запуске программа напечатает:
+```
+GPU: NVIDIA GeForce RTX 5060 (sm_120) — sm_120 NOT in PyTorch Flash Attention list
+```
+
+**Правильное решение — переустановить PyTorch с CUDA 12.8:**
+
+```bash
+# Удалить старый PyTorch
+pip uninstall torch torchvision torchaudio -y
+
+# Установить версию с поддержкой Blackwell (sm_120)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
+
+**Временное решение (без переустановки) — флаг `--torch-compile`:**
+
+```bash
+python src/main.py ... --torch-compile --width 768 --height 768 --steps 20
+```
+
+`torch.compile` JIT-компилирует UNet под конкретную GPU во время первого прогона (2-5 минут), после чего все следующие кадры обрабатываются с нативной скоростью. Без него на Blackwell каждый кадр медленный.
+
 ---
 
 ## Установка
@@ -138,7 +165,13 @@ myvenv\Scripts\Activate.ps1
 
 Выбери команду под своё железо:
 
-#### CUDA 12.1 (Linux / Windows, NVIDIA GPU)
+#### CUDA 12.8 (Linux / Windows, RTX 5000-й серии — Blackwell sm_120) ← **рекомендуется для RTX 5060/5070/5080/5090**
+
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
+
+#### CUDA 12.1 (Linux / Windows, RTX 3000/4000-й серии)
 
 ```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121

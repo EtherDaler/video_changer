@@ -3,7 +3,10 @@
 # NOTE: Install PyTorch FIRST from https://pytorch.org/get-started
 # BEFORE running pip install -r requirements.txt
 #
-#   CUDA (NVIDIA GPU):
+#   RTX 5000-й серии (Blackwell, sm_120) — CUDA 12.8:
+#     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+#
+#   CUDA (RTX 3000/4000-й, NVIDIA GPU):
 #     pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 #
 #   macOS (Apple Silicon / Intel):
@@ -56,3 +59,7 @@ invisible-watermark>=0.2.0
 
 # Optional — memory-efficient attention on CUDA (skip on macOS / CPU)
 # xformers>=0.0.26
+
+# Optional — needed by torch.compile (--torch-compile flag) on Linux/Windows
+# Usually ships with PyTorch; install separately only if torch.compile fails:
+# pip install triton
