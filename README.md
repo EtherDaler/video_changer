@@ -52,12 +52,18 @@ AI-инструмент для замены объектов на видео: н
 
 ## Требования к железу
 
-| Режим | Минимум | Рекомендуется |
-|-------|---------|---------------|
-| CUDA (Linux / Windows) | GPU 8 GB VRAM | GPU 16+ GB VRAM |
-| MPS (macOS Apple Silicon) | 16 GB RAM | 32 GB unified memory |
-| CPU | 32 GB RAM | — (очень медленно) |
+| Режим | VRAM / RAM | Флаг | Время/кадр |
+|-------|-----------|------|-----------|
+| CUDA, 16+ GB VRAM | полная загрузка | *(нет)* | ~5-10 сек |
+| CUDA, 8 GB VRAM | CPU offload | `--cpu-offload` | ~15-25 сек |
+| CUDA, 6 GB VRAM | Sequential offload | `--sequential-offload` | ~30-60 сек |
+| MPS (Apple Silicon) | 16 GB unified | *(авто)* | ~3 мин |
+| CPU | 32 GB RAM | *(авто)* | ~10-20 мин |
 
+> **RTX 5060 / 3060 / 4060 (8 GB)**: добавь `--cpu-offload`. SDXL+ControlNet+IP-Adapter суммарно требуют ~8 GB, CPU offload снижает пиковое потребление до ~4 GB.
+>
+> **xformers** (только NVIDIA): установи `pip install xformers` для дополнительного снижения VRAM на ~15-20%.
+>
 > На macOS MPS SDXL обрабатывает ~3 мин/кадр. Для быстрой проверки используй `--steps 10`.
 
 ---
@@ -434,6 +440,13 @@ python src/main.py --device cpu ...
 | `--no-poisson` | выкл | Отключить Poisson seamless blending |
 | `--blend-alpha` | `0.85` | Темпоральный блендинг (1.0 = без сглаживания) |
 
+### Управление памятью GPU
+
+| Параметр | По умолчанию | Описание |
+|----------|-------------|----------|
+| `--cpu-offload` | выкл | Модели перемещаются в CPU RAM по необходимости (~4 GB VRAM) |
+| `--sequential-offload` | выкл | Один слой на GPU одновременно (~3 GB VRAM, медленнее) |
+
 ### ControlNet / Optical flow
 
 | Параметр | По умолчанию | Описание |
@@ -469,9 +482,19 @@ python src/main.py --device cpu ...
 
 ### `CUDA out of memory`
 
+На 8 GB GPU (RTX 3060/4060/5060) — включи CPU offload:
 ```bash
-# Уменьши шаги и/или отключи multi-controlnet
-python src/main.py --steps 15 ...
+python src/main.py --cpu-offload ...
+```
+
+На 6 GB GPU — используй sequential offload (медленнее, но минимальные требования):
+```bash
+python src/main.py --sequential-offload ...
+```
+
+Также помогает: уменьшить шаги, отключить IP-Adapter и multi-controlnet:
+```bash
+python src/main.py --cpu-offload --steps 15 --no-ip-adapter ...
 ```
 
 ### Grounding DINO не находит объект

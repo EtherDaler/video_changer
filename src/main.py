@@ -51,8 +51,17 @@ def load_pipeline(
     use_multi_controlnet: bool = False,
     device: str = DEVICE,
     dtype: torch.dtype = DTYPE,
+    cpu_offload: bool = False,
+    sequential_offload: bool = False,
 ):
-    """Load SDXL inpainting pipeline with Canny (+ Depth) ControlNet."""
+    """
+    Load SDXL inpainting pipeline with Canny (+ Depth) ControlNet.
+
+    Memory modes:
+      default             — all weights on GPU (~8 GB VRAM needed)
+      cpu_offload         — model layers swapped to CPU RAM on demand (~4 GB VRAM)
+      sequential_offload  — one layer at a time on GPU (~3 GB VRAM, slower)
+    """
     if use_multi_controlnet:
         from multy_control_net import build_multi_controlnet_pipe
         return build_multi_controlnet_pipe(dtype, device)
@@ -61,18 +70,34 @@ def load_pipeline(
         "diffusers/controlnet-canny-sdxl-1.0",
         torch_dtype=dtype,
     )
-    controlnet = controlnet.to(device)  # type: ignore[assignment]
+
+    # With cpu_offload we do NOT call .to(device) manually —
+    # the offload hooks move layers automatically during inference.
+    if not (cpu_offload or sequential_offload):
+        controlnet = controlnet.to(device)  # type: ignore[assignment]
 
     pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
         "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
         controlnet=controlnet,
         torch_dtype=dtype,
-    ).to(device)
+    )
 
-    try:
-        pipe.enable_xformers_memory_efficient_attention()
-    except Exception:
-        pass
+    if sequential_offload:
+        # Minimum VRAM (~3 GB). Each sub-module moves to GPU one at a time.
+        pipe.enable_sequential_cpu_offload()
+        print("  Memory mode: sequential CPU offload (~3 GB VRAM)")
+    elif cpu_offload:
+        # Good balance — model blocks move to GPU only when needed (~4 GB VRAM).
+        pipe.enable_model_cpu_offload()
+        print("  Memory mode: model CPU offload (~4 GB VRAM)")
+    else:
+        pipe = pipe.to(device)
+        # xformers gives ~15-20% VRAM reduction on NVIDIA via memory-efficient attention
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            print("  xformers memory-efficient attention enabled")
+        except Exception:
+            pass
 
     pipe.set_progress_bar_config(disable=True)
     return pipe, None
@@ -828,6 +853,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--light-angle",     type=float, default=None,
                    help="Override estimated light direction in degrees (0=right, 90=top, 180=left)")
 
+    # Memory management
+    p.add_argument("--cpu-offload", action="store_true",
+                   help="Enable model CPU offload (~4 GB VRAM). Recommended for 8 GB GPUs.")
+    p.add_argument("--sequential-offload", action="store_true",
+                   help="Enable sequential CPU offload (~3 GB VRAM, slower). For 6 GB GPUs.")
+
     # ControlNet / flow
     p.add_argument("--multi-controlnet", action="store_true",
                    help="Use Canny + Depth ControlNet")
@@ -883,7 +914,11 @@ def main() -> None:
 
     # ── 4. Diffusion pipeline (loaded after SAM2 is freed) ────────────────
     print("Loading diffusion pipeline…")
-    pipe, depth_detector = load_pipeline(args.multi_controlnet)
+    pipe, depth_detector = load_pipeline(
+        args.multi_controlnet,
+        cpu_offload=args.cpu_offload,
+        sequential_offload=args.sequential_offload,
+    )
 
     # IP-Adapter: load weights so first inpainted frame can guide all others
     ip_adapter_ok = False
