@@ -970,20 +970,28 @@ def main() -> None:
             print(f"RAFT unavailable ({e}), falling back to Farneback.")
 
     # ── 6. Frame loop ─────────────────────────────────────────────────────
+    import time
+
     prev_result: np.ndarray | None = None
     ip_reference: Image.Image | None = None   # set after first successful inpaint
     processed: list[np.ndarray] = []
 
-    for i, frame in enumerate(frames):
-        print(f"  Frame {i + 1}/{len(frames)}", end="\r", flush=True)
+    n_frames = len(frames)
+    n_with_object = sum(m.any() for m in tracked_masks)
+    frames_done = 0          # counts only frames that go through diffusion
+    loop_start = time.time()
 
+    for i, frame in enumerate(frames):
         mask = tracked_masks[i]
 
         # Skip frames where object is not visible — no diffusion needed
         if not mask.any():
+            print(f"  [{i + 1}/{n_frames}] skip (no object)", flush=True)
             processed.append(frame.copy())
             prev_result = None
             continue
+
+        t0 = time.time()
 
         # Optical flow — only for temporal blending
         if i > 0:
@@ -1021,6 +1029,7 @@ def main() -> None:
                 pipe.set_ip_adapter_scale(args.ip_adapter_scale)
             ip_placeholder = None
 
+        print(f"  [{i + 1}/{n_frames}] inpainting…", end="  ", flush=True)
         inpainted = inpaint_frame(
             pipe, frame, mask, control_image,
             args.prompt, args.negative_prompt,
@@ -1075,7 +1084,14 @@ def main() -> None:
         processed.append(inpainted)
         torch.cuda.empty_cache()
 
-    print()  # newline after \r progress
+        frames_done += 1
+        elapsed = time.time() - t0
+        total_elapsed = time.time() - loop_start
+        avg_sec = total_elapsed / frames_done
+        remaining = (n_with_object - frames_done) * avg_sec
+        mins, secs = divmod(int(remaining), 60)
+        print(f"{elapsed:.1f}s/frame  |  ETA {mins}m {secs:02d}s  "
+              f"({frames_done}/{n_with_object} object frames done)", flush=True)
 
     # ── 7. Assembly ───────────────────────────────────────────────────────
     print(f"Assembling '{args.output}'…")
