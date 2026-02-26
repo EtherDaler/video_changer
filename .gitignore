@@ -29,8 +29,11 @@ myvenv/src/sam-2/
 # GroundingDINO (если клонировали как репо)
 GroundingDINO/
 
-# RAFT (опциональный optical flow)
+# Доп репозитории
 RAFT/
+ControlNet/
+sam2/
+SAM2/
 
 # Видео файлы
 videos/
