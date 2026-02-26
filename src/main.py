@@ -991,11 +991,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--light-angle",     type=float, default=None,
                    help="Override estimated light direction in degrees (0=right, 90=top, 180=left)")
 
+    # Speed
+    p.add_argument("--fast", action="store_true",
+                   help=(
+                       "Maximum speed: 768×768, 15 steps, no IP-Adapter. "
+                       "~3–5× faster than defaults. Quality may drop slightly."
+                   ))
+
     # Resolution (lower = faster; SDXL works best at 768–1024)
     p.add_argument("--width",  type=int, default=1024,
-                   help="Processing width in pixels (default 1024). Use 768 for ~3x speedup on slow GPUs.")
+                   help="Processing width in pixels (default 1024). Use 768 for ~2× speedup.")
     p.add_argument("--height", type=int, default=1024,
-                   help="Processing height in pixels (default 1024). Use 768 for ~3x speedup on slow GPUs.")
+                   help="Processing height in pixels (default 1024). Use 768 for ~2× speedup.")
 
     # Memory management
     p.add_argument("--cpu-offload", action="store_true",
@@ -1006,12 +1013,12 @@ def parse_args() -> argparse.Namespace:
                    help="Enable attention slicing (alternative attention code path, helps on new GPU architectures).")
     p.add_argument("--torch-compile", action="store_true",
                    help=(
-                       "JIT-compile UNet with torch.compile (mode=reduce-overhead). "
-                       "Generates GPU-specific kernels at runtime — essential for new "
-                       "architectures like Blackwell (RTX 5060) where Flash Attention is "
-                       "not pre-compiled in PyTorch. First frame is slow (2-5 min warm-up), "
-                       "subsequent frames run at full speed."
+                       "JIT-compile UNet with torch.compile. "
+                       "First frame: 2–5 min warm-up, subsequent frames much faster. "
+                       "Enabled by default on Blackwell (RTX 5060+)."
                    ))
+    p.add_argument("--no-torch-compile", action="store_true",
+                   help="Disable torch.compile even on Blackwell (use if it causes errors)")
 
     # ControlNet / flow
     p.add_argument("--multi-controlnet", action="store_true",
@@ -1051,10 +1058,29 @@ def main() -> None:
         DTYPE = torch.bfloat16
         print("  Auto: switched to bfloat16 (native Blackwell hardware)")
 
+    # Apply --fast overrides (maximum speed, lower quality)
+    if args.fast:
+        args.steps = 15
+        args.width = 768
+        args.height = 768
+        args.no_ip_adapter = True
+        print("  --fast: 768×768, 15 steps, IP-Adapter disabled")
+
     # Apply resolution override (must happen before frame extraction)
     global WIDTH, HEIGHT
     WIDTH  = args.width
     HEIGHT = args.height
+
+    # torch.compile: essential for Blackwell speed; default ON there
+    use_torch_compile = args.torch_compile or (_is_blackwell() and not args.no_torch_compile)
+    args.torch_compile = use_torch_compile
+    if use_torch_compile and _is_blackwell():
+        print("  torch.compile: ON (default for Blackwell — first frame warm-up 2–5 min)")
+
+    # Fewer steps on Blackwell by default (20 vs 30) — noticeable speedup, minor quality loss
+    if _is_blackwell() and args.steps == 30 and not args.fast:
+        args.steps = 20
+        print("  steps: 20 (default on Blackwell, use --steps 30 for max quality)")
 
     print(f"Device: {DEVICE}  |  dtype: {DTYPE}  |  resolution: {WIDTH}×{HEIGHT}")
 
@@ -1145,7 +1171,7 @@ def main() -> None:
         cpu_offload=args.cpu_offload,
         sequential_offload=args.sequential_offload,
         attention_slicing=args.attention_slicing,
-        torch_compile=args.torch_compile,
+        torch_compile=use_torch_compile,
     )
 
     # IP-Adapter: load weights so first inpainted frame can guide all others
