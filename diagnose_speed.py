@@ -24,6 +24,14 @@ import numpy as np
 _nvidia_smi_log: list[str] = []
 _nvidia_smi_stop = threading.Event()
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
+torch.backends.cuda.enable_flash_sdp(True)
+torch.backends.cuda.enable_mem_efficient_sdp(True)
+torch.backends.cuda.enable_math_sdp(False)
+
 
 def _nvidia_smi_loop():
     """Периодически читает nvidia-smi -q -d CLOCK в фоне."""
@@ -105,8 +113,14 @@ from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import
 
 pure_pipe = StableDiffusionXLPipeline.from_pretrained(
     "stabilityai/stable-diffusion-xl-base-1.0",
-    torch_dtype=dtype,
+    torch_dtype=torch.float16,
+    variant="fp16",
 ).to("cuda")
+
+pure_pipe.enable_vae_tiling()
+pure_pipe.vae.to(memory_format=torch.channels_last)
+
+
 
 # Запускаем nvidia-smi в фоне во время теста
 _nvidia_smi_log.clear()
@@ -152,17 +166,25 @@ from diffusers.pipelines.controlnet.pipeline_controlnet_inpaint_sd_xl import (
     StableDiffusionXLControlNetInpaintPipeline,
 )
 
-_controlnet = ControlNetModel.from_pretrained(
+controlnet = ControlNetModel.from_pretrained(
     "diffusers/controlnet-canny-sdxl-1.0",
-    torch_dtype=dtype,
-)
-controlnet = _controlnet.to("cuda")
+    torch_dtype=torch.float16,
+    variant="fp16",
+).to("cuda")
 
 our_pipe = StableDiffusionXLControlNetInpaintPipeline.from_pretrained(
     "diffusers/stable-diffusion-xl-1.0-inpainting-0.1",
     controlnet=controlnet,
-    torch_dtype=dtype,
+    torch_dtype=torch.float16,
+    variant="fp16",
 ).to("cuda")
+
+our_pipe.unet = torch.compile(our_pipe.unet, mode="max-autotune")
+
+our_pipe.enable_vae_tiling()
+our_pipe.unet.to(memory_format=torch.channels_last)
+our_pipe.vae.to(memory_format=torch.channels_last)
+
 
 # Явно отключаем всё, что может замедлять (как в ШАГ 2)
 if hasattr(our_pipe, "disable_attention_slicing"):
@@ -191,8 +213,8 @@ if "xformers" in str(proc_type).lower():
 # ШАГ 3: cpu offload не используем (мы загрузили .to("cuda"))
 
 # Генерация тестового изображения и маски
-print("\n--- Тест нашего пайплайна (768x768, 5 steps) ---")
-h, w = 768, 768
+print("\n--- Тест нашего пайплайна (640x640, 5 steps) ---")
+h, w = 640, 640
 img = np.zeros((h, w, 3), dtype=np.uint8) + 128
 mask = np.zeros((h, w), dtype=np.uint8)
 mask[200:400, 200:400] = 255  # маленький квадрат в центре
@@ -248,7 +270,7 @@ PyTorch: {torch.__version__}
 CUDA: {torch.version.cuda}
 
 PURE SDXL TIME (10 steps, 512x512): {pure_time:.2f} sec
-OUR PIPELINE TIME (5 steps, 768x768): {our_time:.2f} sec
+OUR PIPELINE TIME (5 steps, 640x640): {our_time:.2f} sec
 
 dtype UNet: {next(our_pipe.unet.parameters()).dtype}
 device UNet: {next(our_pipe.unet.parameters()).device}
