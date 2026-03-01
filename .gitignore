@@ -25,6 +25,8 @@ __pycache__/
 
 # SAM2 (editable install via pip)
 myvenv/src/sam-2/
+src/sam2/
+src/sam-2/
 
 # GroundingDINO (если клонировали как репо)
 GroundingDINO/
@@ -34,6 +36,8 @@ RAFT/
 ControlNet/
 sam2/
 SAM2/
+sam-2/
+SAM-2/
 
 # Видео файлы
 videos/
