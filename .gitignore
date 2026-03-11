@@ -3,6 +3,7 @@ myvenv/
 venv/
 .venv/
 .env
+token.txt
 
 # Python cache
 __pycache__/
