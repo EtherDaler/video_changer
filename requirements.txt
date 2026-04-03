@@ -53,6 +53,8 @@ huggingface_hub>=0.23.0
 
 # Misc
 tqdm>=4.66.0
+requests>=2.31.0
+replicate>=0.26.0
 PyYAML>=6.0
 omegaconf>=2.3.0        # needed for RAFT
 invisible-watermark>=0.2.0
