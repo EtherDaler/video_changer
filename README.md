@@ -1,8 +1,36 @@
 # Video Object Replacer
 
-AI-инструмент для замены объектов на видео: нейросеть находит объект, строит точную маску и закрашивает его новым контентом покадрово — с сохранением освещения, зернистости и плавности между кадрами.
+AI-инструмент для замены объектов на видео: нейросеть находит объект, строит точную маску и подменяет его новым контентом покадрово — с сохранением фона и плавности между кадрами.
 
-## Как это работает
+## Два пути в репозитории
+
+| Путь | Файл | Суть |
+|------|------|------|
+| **Актуальный ROI + Gen-API** | [`video_changer_colab_v3.ipynb`](video_changer_colab_v3.ipynb) | Grounding DINO → SAM2 video → **WAN / Nano Banana 2 / Bria** только по ROI + склейка. Запуск из корня `video_changer/`, код в `src/`. |
+| **Локальный SDXL** | [`src/main.py`](src/main.py) | Классический SDXL Inpainting + ControlNet + IP-Adapter (см. разделы ниже). |
+
+Подробности по Colab v3 — в следующем подразделе; остальной README описывает в основном **`main.py`** и установку общих зависимостей.
+
+### `video_changer_colab_v3.ipynb` — пайплайн и конфиг
+
+1. **Детекция и трек**: Grounding DINO (скан кадров) → SAM2 маска на seed → **video tracking** масок, `fill_mask_gaps`.
+2. **Сцены**: гистограммы HSV → границы планов (shot cuts).
+3. **Поведение по кадру**: optical flow + IoU масок → решение «регенерация vs warp предыдущего ROI» (для режимов без кэша cutout).
+4. **Диффузия** (`API_MODE` в конфиге):
+   - **`nano`** — Gen-API **Nano Banana 2**: ROI + маска SAM, опционально референс первой генерации; апскейл входа задаётся **`roi_min_side_for_api`**, качество JPEG — **`api_jpeg_quality`**, разрешение запроса — **`nano_resolution`**.
+   - **`bria`** — Gen-API **Replace Item**; маска для API — **вырез SAM в ROI** (не весь прямоугольник); см. `BRIA_EXTRA_PADDING`.
+   - **`wan`** — Replicate WAN inpaint (нужен **`REPLICATE_API_TOKEN`**).
+5. **Nano + cutout (рекомендуется для релиза)**:
+   - После ответа Nano на кропе запускаются **Grounding DINO + SAM2** с отдельным коротким промптом **`nano_cutout_grounding_prompt`** (1–3 слова на англ.; **не** полный `replace_prompt` — иначе DINO даёт ложные боксы). Устаревшее имя: `nano_cutout_detect_prompt`.
+   - Вырез объекта с альфой вставляется на **исходный** кадр (`src/v3_nano_cutout.py`).
+   - **`NANO_CACHED_CUTOUT`**: один tight-вырез на сегмент до смены плана или пропажи объекта; дальше только геометрия по маске, **без повторных вызовов** Nano.
+6. **Секреты**: **`GEN_API_KEY`** (nano/bria) и при необходимости **`REPLICATE_API_TOKEN`** — через переменные окружения или поля конфига **без коммита** ключей в git.
+
+Исходники: `src/nano_genapi.py`, `src/v3_compositing.py`, `src/v3_nano_cutout.py`, `src/v3_notebook_compat.py`, `src/replicate_wan.py`.
+
+---
+
+## Как это работает (`src/main.py` — SDXL)
 
 ```
 Видео
@@ -325,19 +353,26 @@ pip install xformers
 ```
 video_changer/
 ├── src/
-│   ├── main.py             — основной скрипт
-│   ├── detector.py         — Grounding DINO + SAM2 (text→mask)
-│   ├── sam_load.py         — SAM2 Image Predictor
-│   ├── sam_video.py        — SAM2 Video Predictor (трекинг по всему видео)
-│   ├── ui.py               — интерактивный OpenCV UI
-│   ├── raft_load.py        — RAFT optical flow (опционально)
+│   ├── main.py              — основной CLI (SDXL)
+│   ├── detector.py          — Grounding DINO + SAM2 (text→mask)
+│   ├── sam_load.py          — SAM2 Image Predictor
+│   ├── sam_video.py         — SAM2 Video Predictor (трекинг)
+│   ├── nano_genapi.py       — Gen-API Nano Banana 2 / Bria Replace Item
+│   ├── v3_compositing.py    — склейка ROI (ноутбук v3)
+│   ├── v3_nano_cutout.py    — вырез после Nano + кэш cutout
+│   ├── v3_notebook_compat.py— обёртки детектора/SAM для v3
+│   ├── replicate_wan.py     — WAN inpaint через Replicate
+│   ├── ui.py                — интерактивный OpenCV UI
+│   ├── raft_load.py         — RAFT (опционально)
 │   └── multy_control_net.py — Multi-ControlNet (Canny + Depth)
-├── sam2_hiera_large.pt          ← скачать (шаг 5)
-├── groundingdino_swint_ogc.pth  ← скачать (шаг 5)
-├── RAFT/                        ← опционально (шаг 5)
-├── videos/                      ← папка для входных/выходных видео
+├── video_changer_colab_v3.ipynb  — основной видео-пайплайн (Gen-API / WAN)
+├── sam2_hiera_large.pt           ← скачать (шаг 5)
+├── groundingdino_swint_ogc.pth   ← скачать (шаг 5)
+├── RAFT/                         ← опционально (шаг 5)
+├── videos/
 ├── myvenv/
 ├── requirements.txt
+├── AGENTS.md                     — контекст для агента / разработки
 └── README.md
 ```
 
