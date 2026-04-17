@@ -16,6 +16,8 @@ import numpy as np
 import urllib.request
 from PIL import Image
 
+from src.nano_genapi import mask_for_genapi_inpaint
+
 
 def _frames_to_tmp_mp4(
     frames_bgr: list[np.ndarray],
@@ -73,6 +75,9 @@ def call_wan_inpaint_replicate(
     model: str,
     seed: int,
     sampling_steps: int,
+    genapi_mask_dilate_px: int = 0,
+    genapi_mask_blur_sigma: float = 0.0,
+    genapi_mask_expand_frac: float = 0.0,
 ) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
     """
     Один «чанк» из одного кадра: временные mp4 → Replicate WAN inpaint.
@@ -95,6 +100,13 @@ def call_wan_inpaint_replicate(
     cw, ch = x2 - x1, y2 - y1
     if (mw, mh) != (cw, ch):
         m = cv2.resize(m, (cw, ch), interpolation=cv2.INTER_NEAREST)
+
+    m = mask_for_genapi_inpaint(
+        m,
+        dilate_px=genapi_mask_dilate_px,
+        blur_sigma=genapi_mask_blur_sigma,
+        expand_frac=genapi_mask_expand_frac,
+    )
 
     mask_bgr = cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)
     size_xy = (cw, ch)

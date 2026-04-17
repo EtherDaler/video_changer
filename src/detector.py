@@ -111,6 +111,60 @@ def detect_bbox(
     return (x1, y1, x2, y2), phrases[best], float(logits[best])
 
 
+def detect_bboxes_multi(
+    model,
+    image_np: np.ndarray,
+    text_prompt: str,
+    box_threshold: float = 0.82,
+    text_threshold: float = 0.77,
+    device: str = "cpu",
+    max_detections: int = 10,
+) -> list[tuple[tuple[int, int, int, int], str, float]]:
+    """
+    Все детекции Grounding DINO по *text_prompt* (по убыванию confidence), не более *max_detections*.
+    Координаты bbox в пикселях, как у :func:`detect_bbox`.
+    """
+    from groundingdino.util.inference import predict
+
+    image_tensor = _preprocess_for_gdino(image_np)
+    h, w = image_np.shape[:2]
+
+    boxes, logits, phrases = predict(
+        model=model,
+        image=image_tensor,
+        caption=text_prompt,
+        box_threshold=box_threshold,
+        text_threshold=text_threshold,
+        device=device,
+    )
+
+    if len(boxes) == 0:
+        return []
+
+    scores = logits.detach().float().cpu().numpy() if hasattr(logits, "detach") else np.asarray(
+        logits, dtype=np.float32
+    )
+    order = np.argsort(-scores)
+    out: list[tuple[tuple[int, int, int, int], str, float]] = []
+    n = min(len(boxes), int(max_detections))
+
+    for k in range(n):
+        i = int(order[k])
+        cx, cy, bw, bh = boxes[i].tolist()
+        x1 = max(0, int((cx - bw / 2) * w))
+        y1 = max(0, int((cy - bh / 2) * h))
+        x2 = min(w, int((cx + bw / 2) * w))
+        y2 = min(h, int((cy + bh / 2) * h))
+        x2 = max(x1 + 1, x2)
+        y2 = max(y1 + 1, y2)
+        if isinstance(phrases, (list, tuple)):
+            phrase = str(phrases[i])
+        else:
+            phrase = str(phrases)
+        out.append(((x1, y1, x2, y2), phrase, float(scores[i])))
+    return out
+
+
 # ──────────────────────────────────────────────
 # SAM2 WITH BOUNDING-BOX PROMPT
 # ──────────────────────────────────────────────

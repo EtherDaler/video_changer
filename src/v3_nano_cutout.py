@@ -184,6 +184,145 @@ def mask_new_object_on_generated_crop_retry(
     return None
 
 
+def _expand_bbox_min_side(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    w_img: int,
+    h_img: int,
+    min_side: int,
+) -> Tuple[int, int, int, int]:
+    """Расширяет bbox до min_side по каждой стороне (центр сохраняется), клип по кадру."""
+    cw, ch = x2 - x1, y2 - y1
+    if cw >= min_side and ch >= min_side:
+        return x1, y1, x2, y2
+    cx = (x1 + x2) * 0.5
+    cy = (y1 + y2) * 0.5
+    nw = max(cw, min_side)
+    nh = max(ch, min_side)
+    nx1 = int(round(cx - nw * 0.5))
+    ny1 = int(round(cy - nh * 0.5))
+    nx2 = nx1 + nw
+    ny2 = ny1 + nh
+    if nx1 < 0:
+        nx2 -= nx1
+        nx1 = 0
+    if ny1 < 0:
+        ny2 -= ny1
+        ny1 = 0
+    if nx2 > w_img:
+        nx1 -= nx2 - w_img
+        nx2 = w_img
+    if ny2 > h_img:
+        ny1 -= ny2 - h_img
+        ny2 = h_img
+    nx1 = max(0, nx1)
+    ny1 = max(0, ny1)
+    nx2 = min(w_img, max(nx1 + 1, nx2))
+    ny2 = min(h_img, max(ny1 + 1, ny2))
+    return nx1, ny1, nx2, ny2
+
+
+def _resize_bgr_to_roi(gen_bgr: np.ndarray, target_wc: int, target_hc: int) -> np.ndarray:
+    if target_wc < 1 or target_hc < 1:
+        return gen_bgr
+    h0, w0 = gen_bgr.shape[:2]
+    if h0 == target_hc and w0 == target_wc:
+        return gen_bgr
+    inter = (
+        cv2.INTER_AREA
+        if h0 * w0 > target_hc * target_wc
+        else cv2.INTER_LANCZOS4
+    )
+    return cv2.resize(gen_bgr, (target_wc, target_hc), interpolation=inter)
+
+
+def align_nano_api_output_to_roi_crop(
+    gen_bgr: np.ndarray,
+    target_wc: int,
+    target_hc: int,
+    gdino_model,
+    sam_image_predictor,
+    cfg,
+) -> np.ndarray:
+    """
+    Ответ Nano часто «шире» по смыслу, чем наш tight ROI (image2): вместо растягивания всего кадра API
+    на pb — маска нового объекта на полном ответе, tight crop + чуть padding, resize в размер ROI склейки.
+    """
+    if target_wc < 1 or target_hc < 1:
+        return gen_bgr
+    h0, w0 = gen_bgr.shape[:2]
+    mask = mask_new_object_on_generated_crop_retry(
+        gen_bgr,
+        gdino_model,
+        sam_image_predictor,
+        resolve_nano_cutout_grounding_prompt(cfg),
+        cfg,
+    )
+    if mask is None:
+        return _resize_bgr_to_roi(gen_bgr, target_wc, target_hc)
+    if mask.ndim == 3:
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    bb = _mask_to_bbox(mask)
+    if bb is None:
+        return _resize_bgr_to_roi(gen_bgr, target_wc, target_hc)
+    x1, y1, x2, y2 = bb
+    bw, bh = x2 - x1, y2 - y1
+    pad_frac = float(getattr(cfg, "nano_align_tight_padding_frac", 0.08))
+    px = int(round(bw * pad_frac))
+    py = int(round(bh * pad_frac))
+    tx1 = max(0, x1 - px)
+    ty1 = max(0, y1 - py)
+    tx2 = min(w0, x2 + px)
+    ty2 = min(h0, y2 + py)
+    min_side = int(getattr(cfg, "nano_align_min_crop_side", 32))
+    tx1, ty1, tx2, ty2 = _expand_bbox_min_side(tx1, ty1, tx2, ty2, w0, h0, min_side)
+    patch = gen_bgr[ty1:ty2, tx1:tx2]
+    if patch.size == 0:
+        return _resize_bgr_to_roi(gen_bgr, target_wc, target_hc)
+    return _resize_bgr_to_roi(patch, target_wc, target_hc)
+
+
+def refine_full_mask_after_nano_gen(
+    mask_full_u8: np.ndarray,
+    gen_crop_bgr: np.ndarray,
+    pb: Tuple[int, int, int, int],
+    gdino_model,
+    sam_image_predictor,
+    cfg,
+) -> np.ndarray:
+    """
+    После ответа Nano Banana: Grounding DINO + SAM2 на **сгенерированном** ROI — маска нового объекта;
+    подставляет её в полноразмерную маску в области `pb` (для корректной склейки при несовпадении размеров/кадра API).
+
+    При неудаче детекции возвращает исходную маску без изменений.
+    """
+    m_roi = mask_new_object_on_generated_crop_retry(
+        gen_crop_bgr,
+        gdino_model,
+        sam_image_predictor,
+        resolve_nano_cutout_grounding_prompt(cfg),
+        cfg,
+    )
+    if m_roi is None:
+        return mask_full_u8
+    x1, y1, x2, y2 = pb
+    hc, wc = y2 - y1, x2 - x1
+    if m_roi.ndim == 3:
+        m_roi = cv2.cvtColor(m_roi, cv2.COLOR_BGR2GRAY)
+    if m_roi.shape[0] != hc or m_roi.shape[1] != wc:
+        m_roi = cv2.resize(m_roi, (wc, hc), interpolation=cv2.INTER_NEAREST)
+
+    out = mask_full_u8.copy()
+    if out.ndim == 3:
+        for c in range(out.shape[2]):
+            out[y1:y2, x1:x2, c] = m_roi
+    else:
+        out[y1:y2, x1:x2] = m_roi
+    return out
+
+
 def _paste_scaled_cutout(
     frame_bgr: np.ndarray,
     gen_crop_bgr: np.ndarray,
